@@ -11,5 +11,11 @@ project(
     LANGUAGES CXX
 )
 
+find_package(glfw3 REQUIRED)
+if(TARGET glfw AND NOT TARGET glfw3::glfw3)
+    add_library(glfw3::glfw3 ALIAS glfw)
+endif()
+
 add_subdirectory("src")
 add_subdirectory("deps")
+add_subdirectory(unityDeltacast)

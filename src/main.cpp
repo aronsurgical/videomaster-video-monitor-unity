@@ -47,7 +47,7 @@ int main(int argc, char** argv)
     
     int device_id = 0;
     app.add_option("-d,--device", device_id, "ID of the device to use");
-    int rx_stream_id = 0;
+    int rx_stream_id = 4;
     app.add_option("-i,--input", rx_stream_id, "ID of the input connector to use");
     CLI11_PARSE(app, argc, argv);
 
