@@ -28,11 +28,10 @@ public class UnityDeltacast : MonoBehaviour {
 
     void Start() {
         InitLibrary();
-        int result = AddInts(3, 4);
-        Debug.Log("3 + 4 = " + result);
+        //int result = AddInts(3, 4);
+        //Debug.Log("3 + 4 = " + result);
 
-        string msg = Marshal.PtrToStringAnsi(GetMessage());
-        Debug.Log("Message from DLL: " + msg);
+        //string msg = Marshal.PtrToStringAnsi(GetMessage());
 
         int width = 1920, height = 1080; // adapt to detected signal
         tex = new Texture2D(width, height, TextureFormat.BGRA32, false);
@@ -40,7 +39,8 @@ public class UnityDeltacast : MonoBehaviour {
         handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
         bufferPtr = handle.AddrOfPinnedObject();
 
-        StartCapture(0, 4); // board 0, stream 4
+        StartCapture(0, 0); // board 0, stream RX0
+        //StartCapture(0, 4); // board 0, stream RX4, this is HDMI
         matToShow.mainTexture = tex;
     }
 
@@ -53,11 +53,18 @@ public class UnityDeltacast : MonoBehaviour {
         }
         //matToShow.mainTexture = tex;
         //Graphics.Blit(tex, (RenderTexture)null); // show on screen
-        //Debug.Log(Marshal.PtrToStringAnsi(GetMessage()));
+        printCleanMsg();
     }
 
     void OnDestroy() {
         StopCapture();
         handle.Free();
+    }
+
+    public void printCleanMsg() {
+        string rawMsg = Marshal.PtrToStringAnsi(GetMessage());
+        if(rawMsg.Length > 0) {
+            Debug.Log(rawMsg);
+        }
     }
 }
