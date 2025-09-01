@@ -5,6 +5,7 @@ project(unityDeltacast LANGUAGES CXX)
 add_library(unityDeltacast SHARED
     unityDeltacast.cpp
     unityDeltacast.h
+	../src/helper.cpp
 )
 
 # ---- SDK layout (from your listing) ----

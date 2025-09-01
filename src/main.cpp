@@ -41,13 +41,14 @@ void on_close(int /*signal*/)
     shared_resources.stop_is_requested = true;
 }
 
+
 int main(int argc, char** argv)
 {
     CLI::App app{"Identify an incoming signal and display it on the screen"};
     
     int device_id = 0;
     app.add_option("-d,--device", device_id, "ID of the device to use");
-    int rx_stream_id = 4;
+    int rx_stream_id = 0;
     app.add_option("-i,--input", rx_stream_id, "ID of the input connector to use");
     CLI11_PARSE(app, argc, argv);
 
@@ -89,11 +90,15 @@ int main(int argc, char** argv)
             }
 
             auto signal_information = Application::Helper::detect_information(rx_tech_stream);
+            //signal_information = Application::Helper::SdiSignalInformation{ VHD_VIDEOSTD_S274M_1080i_50Hz, VHD_CLOCKDIV_1, VHD_INTERFACE_3G_B_DS_425_1 };
             auto video_characteristics = Application::Helper::get_video_characteristics(signal_information);
             std::cout << "Detected:" << std::endl;
+            
             Application::Helper::print_information(signal_information, "\t");
+            std::cout << std::to_string(video_characteristics.width);
+            std::cout << std::to_string(video_characteristics.height);
 
-            rx_stream.buffer_queue().set_depth(8);
+            rx_stream.buffer_queue().set_depth(4);
             rx_stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
             Application::Helper::configure_stream(rx_tech_stream, signal_information);
 
@@ -125,6 +130,7 @@ int main(int argc, char** argv)
                 {
                     auto slot = rx_stream.pop_slot();
                     auto [ buffer, buffer_size ] = slot->video().buffer();
+                    
                     
                     renderer.render_buffer(buffer, buffer_size);
                 }
