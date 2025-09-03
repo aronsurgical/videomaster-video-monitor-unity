@@ -1,70 +1,77 @@
 using System;
 using System.Runtime.InteropServices;
 using UnityEngine;
+using static UnityDeltacast;
 
 public class UnityDeltacast : MonoBehaviour {
-    // On Windows, Unity looks in the project root or Plugins folder for DLLs
-    const string DLL_NAME = "unityDeltacast";
 
-    [DllImport(DLL_NAME)]
-    private static extern void InitLibrary();
+    public Vector2Int requestedResolution = new Vector2Int(1280, 720);
 
-    [DllImport(DLL_NAME)]
-    private static extern int AddInts(int a, int b);
+    public string cameraName = "";
 
-    [DllImport(DLL_NAME)]
-    private static extern IntPtr GetMessage();
+    public bool initialized = false;
 
-    [DllImport(DLL_NAME)] static extern void StartCapture(int deviceId, int streamId);
-    [DllImport(DLL_NAME)] static extern void StopCapture();
-    [DllImport(DLL_NAME)] static extern int GetFrame(IntPtr dst, int maxSize);
+    public enum StereoConfig { Mono, LeftOnly, RightOnly, Stereo };
 
-    Texture2D tex;
-    byte[] buffer;
-    GCHandle handle;
-    IntPtr bufferPtr;
+    public StereoConfig stereoConfig;
 
-    public Material matToShow;
+    private DeltacastAdapter deltacastAdapter;
+
+    public Material outputMat;
+
+
+    public void connectDeltacast() {
+        if(cameraName != null && cameraName.StartsWith("DELTACAST")) {
+            deltacastAdapter = new DeltacastAdapter();
+
+            string[] splitDeltacastName = cameraName.Split('_');
+            int boardID = int.Parse(splitDeltacastName[1]);
+            int streamID = int.Parse(splitDeltacastName[2]);
+            string stereoConfigString = splitDeltacastName[3];
+            stereoConfig = Enum.Parse<StereoConfig>(stereoConfigString);
+
+            if(stereoConfig.Equals(StereoConfig.Mono)) {
+                deltacastAdapter.Init(boardID, streamID, requestedResolution.x, requestedResolution.y, false);
+            }
+
+            if(stereoConfig.Equals(StereoConfig.Stereo)) {
+                deltacastAdapter.Init(boardID, streamID, requestedResolution.x, requestedResolution.y, true);
+ 
+            }
+            outputMat.mainTexture = deltacastAdapter.tex;
+            Debug.Log(deltacastAdapter.tex.width);
+            initialized = deltacastAdapter.initialized;
+
+        }
+    }
 
     void Start() {
-        InitLibrary();
-        //int result = AddInts(3, 4);
-        //Debug.Log("3 + 4 = " + result);
+        connectDeltacast();
 
-        //string msg = Marshal.PtrToStringAnsi(GetMessage());
-
-        int width = 1920, height = 1080; // adapt to detected signal
-        tex = new Texture2D(width, height, TextureFormat.BGRA32, false);
-        buffer = new byte[width * height * 4]; // RGBA target
-        handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
-        bufferPtr = handle.AddrOfPinnedObject();
-
-        StartCapture(0, 0); // board 0, stream RX0
-        //StartCapture(0, 4); // board 0, stream RX4, this is HDMI
-        matToShow.mainTexture = tex;
     }
-
     void Update() {
-        int bytes = GetFrame(bufferPtr, buffer.Length);
-        //Debug.Log(bytes);
-        if(bytes > 0) {
-            tex.LoadRawTextureData(buffer);
-            tex.Apply();
+        if(cameraName != null && cameraName.StartsWith("DELTACAST") && deltacastAdapter != null && deltacastAdapter.initialized) {
+            deltacastAdapter.Update();
         }
-        //matToShow.mainTexture = tex;
-        //Graphics.Blit(tex, (RenderTexture)null); // show on screen
-        printCleanMsg();
+    }
+    [ContextMenu("restartDeltacast")]
+    public void restartDeltacast() {
+        stopDeltacast();
+        connectDeltacast();
+
     }
 
-    void OnDestroy() {
-        StopCapture();
-        handle.Free();
+    [ContextMenu("stopDeltacast")]
+    public void stopDeltacast() {
+        if(cameraName != null && cameraName.StartsWith("DELTACAST") && deltacastAdapter != null) {
+            deltacastAdapter.Stop();
+        }
+
+        initialized = false;
+
     }
 
-    public void printCleanMsg() {
-        string rawMsg = Marshal.PtrToStringAnsi(GetMessage());
-        if(rawMsg.Length > 0) {
-            Debug.Log(rawMsg);
-        }
+    void OnApplicationQuit() {
+        stopDeltacast();
     }
 }
