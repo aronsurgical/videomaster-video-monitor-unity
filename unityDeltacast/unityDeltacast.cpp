@@ -119,6 +119,74 @@ static void PackSideBySide_BGRA(const uint8_t* left, int LW, int LH, int LPitch,
     }
 }
 
+// copy left & right BGRA images into a single side-by-side BGRA
+// with simple "bob" deinterlacing, using SDK-provided parity
+static void PackSideBySide_BGRA_deinterlaced(const uint8_t* left, int LW, int LH, int LPitch,
+    const uint8_t* right, int RW, int RH, int RPitch,
+    uint8_t* dst, int outW, int outH,
+    bool topFieldFirst)  
+{
+    const int outPitch = outW * 4;
+    const int leftBytesRow = LW * 4;
+    const int rightBytesRow = RW * 4;
+    const int rightOffset = LW * 4; // bytes to the start of the right image
+
+    for (int y = 0; y < outH; ++y) {
+        uint8_t* drow = dst + y * outPitch;
+
+        // ---------- LEFT ----------
+        if (y < LH) {
+            const uint8_t* crow = left + y * LPitch;
+
+            bool isFieldLine = ((y & 1) == 0);
+            if (!topFieldFirst) isFieldLine = !isFieldLine;  // flip if bottom-field-first
+
+            if (isFieldLine) {
+                // copy original field line
+                std::memcpy(drow, crow, leftBytesRow);
+            }
+            else {
+                // interpolate odd line
+                const int upY = (y > 0) ? (y - 1) : y;
+                const int dnY = (y + 1 < LH) ? (y + 1) : y;
+                const uint8_t* up = left + upY * LPitch;
+                const uint8_t* dn = left + dnY * LPitch;
+                for (int i = 0; i < leftBytesRow; ++i) {
+                    drow[i] = uint8_t((int(up[i]) + int(dn[i])) >> 1);
+                }
+            }
+        }
+        else {
+            std::memset(drow, 0, leftBytesRow);
+        }
+
+        // ---------- RIGHT ----------
+        uint8_t* drowR = drow + rightOffset;
+        if (y < RH) {
+            const uint8_t* crow = right + y * RPitch;
+
+            bool isFieldLine = ((y & 1) == 0);
+            if (!topFieldFirst) isFieldLine = !isFieldLine;
+
+            if (isFieldLine) {
+                std::memcpy(drowR, crow, rightBytesRow);
+            }
+            else {
+                const int upY = (y > 0) ? (y - 1) : y;
+                const int dnY = (y + 1 < RH) ? (y + 1) : y;
+                const uint8_t* up = right + upY * RPitch;
+                const uint8_t* dn = right + dnY * RPitch;
+                for (int i = 0; i < rightBytesRow; ++i) {
+                    drowR[i] = uint8_t((int(up[i]) + int(dn[i])) >> 1);
+                }
+            }
+        }
+        else {
+            std::memset(drowR, 0, rightBytesRow);
+        }
+    }
+}
+
 
 
 static void logHelper(const std::string& msg)
@@ -517,10 +585,11 @@ extern "C" {
                     UYVY_to_BGRA(src, srcPitch, bgra.data(), dstPitch, W, H, true);
                     UYVY_to_BGRA(src2, srcPitch2, bgra2.data(), dstPitch2, W2, H2, true);
 
+                    bool topFieldFirst = (slot->parity() == Slot::Parity::EVEN);
                     // pack into one wide texture
-                    PackSideBySide_BGRA(bgra.data(), W, H, dstPitch,
+                    PackSideBySide_BGRA_deinterlaced(bgra.data(), W, H, dstPitch,
                         bgra2.data(), W2, H2, dstPitch2,
-                        sbsBGRA.data(), outW, outH);
+                        sbsBGRA.data(), outW, outH, topFieldFirst);
 
                     // publish the single combined frame
                     {
