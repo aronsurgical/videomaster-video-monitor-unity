@@ -2,7 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using static DeltacastAdapter;
-using static UnityDeltacast;
+
 
 public class UnityDeltacast : MonoBehaviour {
 
@@ -14,7 +14,7 @@ public class UnityDeltacast : MonoBehaviour {
 
     public bool initialized = false;
 
-    public enum StereoConfig { MONO, LEFTONLY, RIGHTONLY, STEREO };
+    public enum StereoConfig { Mono, SBSLeftOnly, SBSRightOnly, InterlacedEven, InterlacedOdd, SBSFullWidthLeftOnly, SBSFullWidthRightOnly };
     public int boardID;
     public int streamID;
     public StereoConfig stereoConfig;
@@ -33,19 +33,20 @@ public class UnityDeltacast : MonoBehaviour {
 
     public Material outputMat;
 
-
+    public bool showDebug = false;
     public void connectDeltacast() {
         if(readCameraName) {
             if(cameraName != null && cameraName.StartsWith("DELTACAST")) {
                 string[] splitDeltacastName = cameraName.Split('+');
                 boardID = int.Parse(splitDeltacastName[1]);
                 streamID = int.Parse(splitDeltacastName[2]);
-                int w = int.Parse(splitDeltacastName[3]);
-                int h = int.Parse(splitDeltacastName[4]);
+                dvSdiAuto = Enum.Parse<VIDEOINPUT>(splitDeltacastName[3].ToUpper());
+                int w = int.Parse(splitDeltacastName[4]);
+                int h = int.Parse(splitDeltacastName[5]);
                 requestedResolution = new Vector2Int(w, h);
-                progressive = !splitDeltacastName[5].Equals("0");
-                framerate = uint.Parse(splitDeltacastName[6]);
-                dvSdiAuto = Enum.Parse<VIDEOINPUT>(splitDeltacastName[7].ToUpper());
+                progressive = !splitDeltacastName[6].Equals("0");
+                framerate = uint.Parse(splitDeltacastName[7]);
+                
                 cable_color_space = Enum.Parse<VHD_DV_CS>(splitDeltacastName[8].ToUpper());
                 cable_sampling = Enum.Parse<VHD_DV_SAMPLING>(splitDeltacastName[9].ToUpper());
                 video_standard = Enum.Parse<VHD_VIDEOSTANDARD>(splitDeltacastName[10]);
@@ -53,7 +54,7 @@ public class UnityDeltacast : MonoBehaviour {
                 video_interface = Enum.Parse<VHD_INTERFACE>(splitDeltacastName[12].ToUpper());
                 fieldMerge = !splitDeltacastName[13].Equals("0");
                 buffer_packing = Enum.Parse<VHD_BUFFERPACKING>(splitDeltacastName[14].ToUpper());
-                stereoConfig = Enum.Parse<StereoConfig>(splitDeltacastName[15].ToUpper());
+                stereoConfig = Enum.Parse<StereoConfig>(splitDeltacastName[15]);
             }
         }
         if(cameraName != null && cameraName.ToUpper().StartsWith("DELTACAST")) {
@@ -73,17 +74,14 @@ public class UnityDeltacast : MonoBehaviour {
             deltacastAdapter.buffer_packing = this.buffer_packing;
             deltacastAdapter.width = (uint)requestedResolution.x;
             deltacastAdapter.height = (uint)requestedResolution.y;
+            deltacastAdapter.showDebug = this.showDebug;
 
 
 
-            if(stereoConfig.Equals(StereoConfig.MONO)) {
-                deltacastAdapter.Init();
-            }
 
-            if(stereoConfig.Equals(StereoConfig.STEREO)) {
-                deltacastAdapter.Init();
- 
-            }
+            deltacastAdapter.Init();
+
+
             outputMat.mainTexture = deltacastAdapter.tex;
             Debug.Log(deltacastAdapter.tex.width);
             initialized = deltacastAdapter.initialized;

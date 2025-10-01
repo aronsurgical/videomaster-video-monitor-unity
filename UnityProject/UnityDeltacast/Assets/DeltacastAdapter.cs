@@ -51,7 +51,7 @@ public class DeltacastAdapter {
     public VHD_BUFFERPACKING buffer_packing;
     public VIDEOINPUT dvSdiAuto;
 
-
+    public bool showDebug = false;
 
     public void Init() {
         if(initialized) {
@@ -65,7 +65,7 @@ public class DeltacastAdapter {
 
         curW = Math.Max(1, (int)width);
         curH = Math.Max(1, (int)height);
-        if(!stereoConfig.Equals(StereoConfig.STEREO)) {
+        if(!(stereoConfig.Equals(StereoConfig.SBSFullWidthLeftOnly) || stereoConfig.Equals(StereoConfig.SBSFullWidthRightOnly))) {
             tex = new Texture2D(curW, curH, TextureFormat.BGRA32, false);
             buffer = new byte[curW * curH * 4]; // BGRA target
         }
@@ -89,7 +89,7 @@ public class DeltacastAdapter {
 
 
         
-        if(!stereoConfig.Equals(StereoConfig.STEREO)) {
+        if(!(stereoConfig.Equals(StereoConfig.SBSFullWidthLeftOnly) || stereoConfig.Equals(StereoConfig.SBSFullWidthRightOnly))) {
             char dvSdiAutoAsChar;
             if(dvSdiAuto.Equals(VIDEOINPUT.SDI)) {
                 dvSdiAutoAsChar = 'S';
@@ -183,7 +183,9 @@ public class DeltacastAdapter {
 
         string rawMsg = Marshal.PtrToStringAnsi(p);
         if(!string.IsNullOrEmpty(rawMsg)) {
-            Debug.Log(rawMsg);
+            if(showDebug) {
+                Debug.Log(rawMsg);
+            }
         }
     }
 

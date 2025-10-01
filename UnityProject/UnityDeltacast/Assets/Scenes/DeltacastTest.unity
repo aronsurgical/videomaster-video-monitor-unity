@@ -566,9 +566,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 731e501f1ea3e27479c013d2ba3d5e3e, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  requestedResolution: {x: 1280, y: 720}
-  cameraName: DELTACAST+0+0+1920+1080+0+0+SDI+NB_VHD_DV_CS+NB_VHD_DV_SAMPLING+VHD_VIDEOSTD_S274M_1080i_50Hz+VHD_CLOCKDIV_1+VHD_INTERFACE_3G_B_DS_425_1+1+VHD_BUFPACK_VIDEO_YUV422_8+STEREO
-  readCameraName: 0
+  requestedResolution: {x: 1920, y: 1080}
+  cameraName: DELTACAST+0+0+SDI+1920+1080+0+0+NB_VHD_DV_CS+NB_VHD_DV_SAMPLING+VHD_VIDEOSTD_S274M_1080i_50Hz+VHD_CLOCKDIV_1+VHD_INTERFACE_3G_B_DS_425_1+1+VHD_BUFPACK_VIDEO_YUV422_8+SBSFullWidthLeftOnly
+  readCameraName: 1
   initialized: 0
   boardID: 0
   streamID: 0
@@ -584,6 +584,7 @@ MonoBehaviour:
   buffer_packing: 0
   dvSdiAuto: 0
   outputMat: {fileID: 2100000, guid: 677cf04cc85792946bb8fcaafe63f452, type: 2}
+  showDebug: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
