@@ -34,6 +34,8 @@ public class UnityDeltacast : MonoBehaviour {
     public Material outputMat;
 
     public bool showDebug = false;
+
+    public bool capture2 = false;
     public void connectDeltacast() {
         if(readCameraName) {
             if(cameraName != null && cameraName.StartsWith("DELTACAST")) {
@@ -75,6 +77,7 @@ public class UnityDeltacast : MonoBehaviour {
             deltacastAdapter.width = (uint)requestedResolution.x;
             deltacastAdapter.height = (uint)requestedResolution.y;
             deltacastAdapter.showDebug = this.showDebug;
+            deltacastAdapter.capture2 = this.capture2;
 
 
 

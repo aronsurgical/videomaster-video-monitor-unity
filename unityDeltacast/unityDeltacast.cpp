@@ -30,10 +30,14 @@ using namespace Deltacast::Wrapper;
 
 
 static std::atomic<bool> running{ false };
+static std::atomic<bool> running2{ false };
 static std::thread captureThread;
+static std::thread captureThread2;
 
 static std::vector<uint8_t> latestFrame;   // guarded by frameMutex
+static std::vector<uint8_t> latestFrame2;   // guarded by frameMutex
 static std::mutex frameMutex;
+static std::mutex frameMutex2;
 
 
 
@@ -463,6 +467,133 @@ extern "C" {
             });
     }
 
+    //AW: HACK!!! remember to always use both methods
+    UNITYDLL_EXPORT void StartCapture2(int device_id, int rx_stream_id, int buffer_depth, char inputType, unsigned int requested_width, unsigned int requested_height, unsigned int progressive, unsigned int framerate, VHD_DV_CS cable_color_space, VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard, VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, unsigned int fieldMerge, VHD_BUFFERPACKING buffer_packing)
+    {
+        bool expected = false;
+        if (!running2.compare_exchange_strong(expected, true)) return; // already running
+
+        if (buffer_depth <= 0) {
+            buffer_depth = 8;
+        }
+
+        captureThread2 = std::thread([device_id, rx_stream_id, buffer_depth, inputType, requested_width, requested_height, progressive, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMerge, buffer_packing]() {
+            bool started = false;
+            try {
+                auto board = Board::open(device_id, nullptr);
+
+                // open RX tech stream and get base stream
+                auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
+                auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
+
+                // 1) Wait until a signal is present on the connector
+                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running2)) {
+                    throw std::runtime_error("No input detected on the requested RX");
+                }
+
+                // 2) Detect signal information (format, framerate, etc.)
+
+
+                SignalInformation signal_information;
+                if (inputType == 'S' || inputType == 's') {
+                    signal_information = SdiSignalInformation{ video_standard, clock_divisor, video_interface };
+                }
+                else if (inputType == 'D' || inputType == 'd') {
+                    signal_information = DvSignalInformation{ requested_width, requested_height, progressive != 0, framerate, cable_color_space, cable_sampling };
+
+                }
+                else {// prefered inputType == 'A'
+                    signal_information = Application::Helper::detect_information(rx_tech_stream);
+                }
+
+                auto vc = Application::Helper::get_video_characteristics(signal_information);
+                int W = vc.width;
+                int H = vc.height;
+                width2.store(W);
+                height2.store(H);
+
+
+                // 3) Queue depth & packing
+                rx_stream.buffer_queue().set_depth(buffer_depth);
+                rx_stream.set_buffer_packing(buffer_packing);
+
+                //field merge necesary for example in stereo dual stream
+                DC_LOG("fieldMerge=" + std::to_string(fieldMerge));
+                if (fieldMerge != 0) {
+                    rx_stream.enable_field_merge();
+                }
+
+                // 4) Configure stream to match the detected signal
+                Application::Helper::configure_stream(rx_tech_stream, signal_information);
+
+
+
+                // 5) Start the stream
+                rx_stream.start();
+
+                started = true;
+
+                bgra2.resize(size_t(width2) * height2 * 4);
+
+                DC_LOG("width=" + std::to_string(width2));
+                DC_LOG("height=" + std::to_string(height2));
+
+                while (running2.load()) {
+                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running2)) {
+                        continue;
+                    }
+
+                    // If signal changes mid-run, reconfigure
+                    auto cur = Application::Helper::detect_information(rx_tech_stream);
+                    if (cur != signal_information) {
+                        if (started) { rx_stream.stop(); started = false; }
+                        signal_information = cur;
+                        vc = Application::Helper::get_video_characteristics(signal_information);
+                        W = vc.width; H = vc.height;
+                        width2.store(W); height2.store(H);
+                        bgra2.resize(size_t(W) * H * 4);
+
+                        rx_stream.buffer_queue().set_depth(buffer_depth);
+                        rx_stream.set_buffer_packing(buffer_packing);
+                        Application::Helper::configure_stream(rx_tech_stream, signal_information);
+                        rx_stream.start();
+                        started = true;
+                        continue;
+                    }
+
+                    auto slot = rx_stream.pop_slot();
+                    auto [src, totalBytes] = slot->video().buffer();
+
+                    // derive source pitch (handles driver alignment)
+                    if (height2 <= 0) {
+                        continue;
+                    }
+                    int srcPitch = int(totalBytes / height2);   // sanity: if (totalBytes % H) -> alignment mismatch
+                    int dstPitch = width2 * 4;
+
+                    UYVY_to_BGRA(src, srcPitch, bgra2.data(), dstPitch, width2, height2, true);
+
+                    {
+                        std::lock_guard<std::mutex> lock(frameMutex2);
+                        latestFrame2 = bgra2;  // hand BGRA to Unity
+                    }
+                    //log("running");
+                }
+                if (started) {
+                    rx_stream.stop();
+                    started = false;
+                }
+                DC_LOG("finished");
+            }
+            catch (const ApiException& e) {
+                DC_LOG(std::string("ApiException: ") + e.what());
+            }
+            catch (const std::exception& e) {
+                DC_LOG(std::string("std::exception: ") + e.what());
+            }
+            });
+    }
+
     UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth)
     {
         bool expected = false;
@@ -627,12 +758,30 @@ extern "C" {
         }
     }
 
+    UNITYDLL_EXPORT void StopCapture2()
+    {
+        running2.store(false);
+        if (captureThread2.joinable()) {
+            captureThread2.join();
+        }
+    }
+
     UNITYDLL_EXPORT int GetFrame(uint8_t* dst, int maxSize)
     {
         std::lock_guard<std::mutex> lk(frameMutex);
         int n = std::min<int>(maxSize, latestFrame.size());
         if (n > 0) {
             std::memcpy(dst, latestFrame.data(), n);
+        }
+        return n;
+    }
+
+    UNITYDLL_EXPORT int GetFrame2(uint8_t* dst, int maxSize)
+    {
+        std::lock_guard<std::mutex> lk(frameMutex2);
+        int n = std::min<int>(maxSize, latestFrame2.size());
+        if (n > 0) {
+            std::memcpy(dst, latestFrame2.data(), n);
         }
         return n;
     }

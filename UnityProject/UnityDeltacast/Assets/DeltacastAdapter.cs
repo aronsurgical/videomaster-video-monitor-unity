@@ -15,9 +15,12 @@ public class DeltacastAdapter {
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern int GetHeight();
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern IntPtr GetMessage();
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern void StartCapture(int device_id, int rx_stream_id, int buffer_depth, char inputType, uint requested_width, uint requested_height, uint progressive, uint framerate, VHD_DV_CS cable_color_space, VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard, VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, uint fieldMerge, VHD_BUFFERPACKING buffer_packing);
+    [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern void StartCapture2(int device_id, int rx_stream_id, int buffer_depth, char inputType, uint requested_width, uint requested_height, uint progressive, uint framerate, VHD_DV_CS cable_color_space, VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard, VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, uint fieldMerge, VHD_BUFFERPACKING buffer_packing);
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern void StartCaptureStereo(int deviceId, int streamId, int buffer_depth);
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern void StopCapture();
+    [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern void StopCapture2();
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern int GetFrame(IntPtr dst, int maxSize);
+    [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern int GetFrame2(IntPtr dst, int maxSize);
 
     public Texture2D tex;
 
@@ -52,6 +55,7 @@ public class DeltacastAdapter {
     public VIDEOINPUT dvSdiAuto;
 
     public bool showDebug = false;
+    public bool capture2 = false;
 
     public void Init() {
         if(initialized) {
@@ -102,7 +106,12 @@ public class DeltacastAdapter {
             }
             uint progressiveuint = progressive ? (uint)1 : (uint)0;
             uint fieldMergeuint = fieldMerge ? (uint)1 : (uint)0;
-            StartCapture(boardID, streamID, 2, dvSdiAutoAsChar, width, height, progressiveuint, framerate, cable_color_space, cable_sampling, video_standard,clock_divisor , video_interface, fieldMergeuint, buffer_packing); // board 0, stream RX0, bufferdepth
+            if(!capture2) {
+                StartCapture(boardID, streamID, 2, dvSdiAutoAsChar, width, height, progressiveuint, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMergeuint, buffer_packing); // board 0, stream RX0, bufferdepth
+            }
+            else {
+                StartCapture2(boardID, streamID, 2, dvSdiAutoAsChar, width, height, progressiveuint, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMergeuint, buffer_packing); // board 0, stream RX0, bufferdepth
+            }
         }
         else {
             StartCaptureStereo(boardID, streamID, 2); // board 0, stream RX0, bufferdepth
@@ -122,8 +131,13 @@ public class DeltacastAdapter {
         if(w > 0 && h > 0 && (w != curW || h != curH)) {
             RecreateResources(w, h);
         }
-
-        int bytes = GetFrame(bufferPtr, buffer.Length);
+        int bytes;
+        if(!capture2) {
+            bytes = GetFrame(bufferPtr, buffer.Length);
+        }
+        else {
+            bytes = GetFrame2(bufferPtr, buffer.Length);
+        }
         //Debug.Log(bytes);
         if(bytes > 0) {
             tex.LoadRawTextureData(bufferPtr, bytes);
@@ -162,8 +176,17 @@ public class DeltacastAdapter {
 
     public void Stop() {
         try {
-            if(tex != null) { UnityEngine.Object.Destroy(tex); tex = null; }
-            StopCapture();
+            if(tex != null) {
+                UnityEngine.Object.Destroy(tex);
+                tex = null;
+            }
+            if(!capture2) {
+                StopCapture();
+            }
+            else {
+                StopCapture2();
+            }
+            
         }
         finally {
             if(handle.IsAllocated) {

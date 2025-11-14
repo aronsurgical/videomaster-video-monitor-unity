@@ -532,6 +532,7 @@ GameObject:
   m_Component:
   - component: {fileID: 1985706573}
   - component: {fileID: 1985706574}
+  - component: {fileID: 1985706575}
   m_Layer: 0
   m_Name: DeltacastPlugin
   m_TagString: Untagged
@@ -568,7 +569,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   requestedResolution: {x: 1920, y: 1080}
   cameraName: DELTACAST+0+0+SDI+1920+1080+0+0+NB_VHD_DV_CS+NB_VHD_DV_SAMPLING+VHD_VIDEOSTD_S274M_1080i_50Hz+VHD_CLOCKDIV_1+VHD_INTERFACE_3G_B_DS_425_1+1+VHD_BUFPACK_VIDEO_YUV422_8+SBSFullWidthLeftOnly
-  readCameraName: 1
+  readCameraName: 0
   initialized: 0
   boardID: 0
   streamID: 0
@@ -579,12 +580,45 @@ MonoBehaviour:
   framerate: 0
   video_standard: 2
   clock_divisor: 0
-  video_interface: 25
+  video_interface: 2
   fieldMerge: 1
   buffer_packing: 0
   dvSdiAuto: 0
   outputMat: {fileID: 2100000, guid: 677cf04cc85792946bb8fcaafe63f452, type: 2}
   showDebug: 1
+  capture2: 0
+--- !u!114 &1985706575
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1985706571}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 731e501f1ea3e27479c013d2ba3d5e3e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  requestedResolution: {x: 1920, y: 1080}
+  cameraName: DELTACAST+0+0+SDI+1920+1080+0+0+NB_VHD_DV_CS+NB_VHD_DV_SAMPLING+VHD_VIDEOSTD_S274M_1080i_50Hz+VHD_CLOCKDIV_1+VHD_INTERFACE_3G_B_DS_425_1+1+VHD_BUFPACK_VIDEO_YUV422_8+SBSFullWidthLeftOnly
+  readCameraName: 0
+  initialized: 0
+  boardID: 0
+  streamID: 3
+  stereoConfig: 0
+  cable_color_space: 17
+  cable_sampling: 13
+  progressive: 0
+  framerate: 0
+  video_standard: 2
+  clock_divisor: 0
+  video_interface: 2
+  fieldMerge: 1
+  buffer_packing: 0
+  dvSdiAuto: 0
+  outputMat: {fileID: 2100000, guid: dfa5f50f97dd4204f9698a45e71449a5, type: 2}
+  showDebug: 1
+  capture2: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
