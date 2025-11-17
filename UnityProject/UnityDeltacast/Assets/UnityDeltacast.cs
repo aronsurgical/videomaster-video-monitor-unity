@@ -35,7 +35,7 @@ public class UnityDeltacast : MonoBehaviour {
 
     public bool showDebug = false;
 
-    public bool capture2 = false;
+    public int captureIndex = 0;
     public void connectDeltacast() {
         if(readCameraName) {
             if(cameraName != null && cameraName.StartsWith("DELTACAST")) {
@@ -57,6 +57,7 @@ public class UnityDeltacast : MonoBehaviour {
                 fieldMerge = !splitDeltacastName[13].Equals("0");
                 buffer_packing = Enum.Parse<VHD_BUFFERPACKING>(splitDeltacastName[14].ToUpper());
                 stereoConfig = Enum.Parse<StereoConfig>(splitDeltacastName[15]);
+                captureIndex = int.Parse(splitDeltacastName[16]);
             }
         }
         if(cameraName != null && cameraName.ToUpper().StartsWith("DELTACAST")) {
@@ -77,7 +78,7 @@ public class UnityDeltacast : MonoBehaviour {
             deltacastAdapter.width = (uint)requestedResolution.x;
             deltacastAdapter.height = (uint)requestedResolution.y;
             deltacastAdapter.showDebug = this.showDebug;
-            deltacastAdapter.capture2 = this.capture2;
+            deltacastAdapter.captureIndex = this.captureIndex;
 
 
 
