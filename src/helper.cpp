@@ -22,6 +22,7 @@
 #include <VideoMasterCppApi/exception.hpp>
 #include <VideoMasterCppApi/to_string.hpp>
 #include <VideoMasterCppApi/helper/sdi.hpp>
+#include <sstream>
 
 template<class... Ts>
 struct overloaded : Ts... { using Ts::operator()...; };
@@ -204,6 +205,38 @@ namespace Application::Helper
                 std::cout << prefix << to_pretty_string(dv_signal_info.cable_sampling) << std::endl;
             }
         }, signal_information);
+    }
+
+    //AW function
+    std::string get_information_string(const SignalInformation& signal_information, const std::string& prefix) {
+        std::ostringstream out;
+
+        std::visit(overloaded{
+            [&out, &prefix](const SdiSignalInformation& sdi_signal_info)
+            {
+                out << prefix << "Video standard: "
+                    << to_pretty_string(sdi_signal_info.video_standard) << ", ";
+                out << prefix << "Clock divisor: "
+                    << to_pretty_string(sdi_signal_info.clock_divisor) << ", ";
+                out << prefix << "Interface: "
+                    << to_pretty_string(sdi_signal_info.video_interface);
+            },
+            [&out, &prefix](const DvSignalInformation& dv_signal_info)
+            {
+                out << prefix
+                    << dv_signal_info.width << "x"
+                    << dv_signal_info.height
+                    << (dv_signal_info.progressive ? "p" : "i")
+                    << dv_signal_info.framerate << ", ";
+
+                out << prefix
+                    << to_pretty_string(dv_signal_info.cable_color_space) << ", ";;
+                out << prefix
+                    << to_pretty_string(dv_signal_info.cable_sampling);
+            }
+            }, signal_information);
+
+        return out.str();
     }
 
     SignalInformation detect_information(TechStream& stream)

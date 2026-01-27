@@ -77,6 +77,8 @@ namespace Application::Helper
     void configure_stream(TechStream& stream, const SignalInformation& signal_information);
     void print_information(const SignalInformation& signal_information, const std::string& prefix = "");
     SignalInformation detect_information(TechStream& stream);
+    //AW function:
+    std::string get_information_string(const SignalInformation& signal_information, const std::string& prefix = "");
 
     Deltacast::Wrapper::Helper::VideoCharacteristics get_video_characteristics(const SignalInformation& signal_information);
 }
