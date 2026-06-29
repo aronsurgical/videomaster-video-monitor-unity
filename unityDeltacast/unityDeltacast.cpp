@@ -48,6 +48,8 @@ static std::mutex frameMutex[4];
 
 
 
+//static std::vector<uint8_t> bgra;  // scratch BGRA frame
+//static std::vector<uint8_t> bgra2;  // scratch BGRA frame
 
 static std::vector<uint8_t> bgra[4];
 
@@ -55,7 +57,10 @@ static std::vector<uint8_t> bgra[4];
 static std::string message = "Hello Deltacast DLL!\n";
 static std::mutex  messageMutex;
 
-
+//static std::atomic<int> width{ 0 };
+//static std::atomic<int> width2{ 0 };
+//static std::atomic<int> height{ 0 };
+//static std::atomic<int> height2{ 0 };
 
 static std::array<std::atomic<int>, 4> width = {
     std::atomic<int>{0},
@@ -69,6 +74,20 @@ static std::array<std::atomic<int>, 4> height = {
     std::atomic<int>{0},
     std::atomic<int>{0},
     std::atomic<int>{0}
+};
+
+static std::array<std::atomic<bool>, 4> burnInFrameNumber = {
+    std::atomic<bool>{false},
+    std::atomic<bool>{false},
+    std::atomic<bool>{false},
+    std::atomic<bool>{false}
+};
+
+static std::array<std::atomic<unsigned long long>, 4> nativeFrameCounter = {
+    std::atomic<unsigned long long>{0},
+    std::atomic<unsigned long long>{0},
+    std::atomic<unsigned long long>{0},
+    std::atomic<unsigned long long>{0}
 };
 
 
@@ -335,6 +354,125 @@ static void logHelper(const std::string& msg)
 //        });
 //}
 
+static const uint8_t DIGITS_3x5[10][5] = {
+    {0b111, 0b101, 0b101, 0b101, 0b111}, // 0
+    {0b010, 0b110, 0b010, 0b010, 0b111}, // 1
+    {0b111, 0b001, 0b111, 0b100, 0b111}, // 2
+    {0b111, 0b001, 0b111, 0b001, 0b111}, // 3
+    {0b101, 0b101, 0b111, 0b001, 0b001}, // 4
+    {0b111, 0b100, 0b111, 0b001, 0b111}, // 5
+    {0b111, 0b100, 0b111, 0b101, 0b111}, // 6
+    {0b111, 0b001, 0b001, 0b001, 0b001}, // 7
+    {0b111, 0b101, 0b111, 0b101, 0b111}, // 8
+    {0b111, 0b101, 0b111, 0b001, 0b111}  // 9
+};
+
+static void SetPixelBGRA(uint8_t* img, int W, int H, int pitch, int x, int y,
+    uint8_t b, uint8_t g, uint8_t r, uint8_t a = 255)
+{
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+
+    uint8_t* p = img + y * pitch + x * 4;
+    p[0] = b;
+    p[1] = g;
+    p[2] = r;
+    p[3] = a;
+}
+
+static void FillRectBGRA(uint8_t* img, int W, int H, int pitch,
+    int x0, int y0, int rw, int rh,
+    uint8_t b, uint8_t g, uint8_t r, uint8_t a = 255)
+{
+    for (int y = y0; y < y0 + rh; ++y) {
+        for (int x = x0; x < x0 + rw; ++x) {
+            SetPixelBGRA(img, W, H, pitch, x, y, b, g, r, a);
+        }
+    }
+}
+
+static void DrawDigit3x5BGRA(uint8_t* img, int W, int H, int pitch,
+    int digit, int x0, int y0, int scale,
+    uint8_t b, uint8_t g, uint8_t r,
+    bool flipTextY)
+{
+    if (digit < 0 || digit > 9) return;
+
+    for (int row = 0; row < 5; ++row) {
+        int srcRow = flipTextY ? (4 - row) : row;
+        uint8_t bits = DIGITS_3x5[digit][srcRow];
+
+        for (int col = 0; col < 3; ++col) {
+            bool on = (bits & (1 << (2 - col))) != 0;
+            if (!on) continue;
+
+            for (int sy = 0; sy < scale; ++sy) {
+                for (int sx = 0; sx < scale; ++sx) {
+                    SetPixelBGRA(
+                        img, W, H, pitch,
+                        x0 + col * scale + sx,
+                        y0 + row * scale + sy,
+                        b, g, r, 255
+                    );
+                }
+            }
+        }
+    }
+}
+
+static void BurnFrameNumberBGRA(uint8_t* img,
+    int imageW,
+    int imageH,
+    int pitch,
+    unsigned long long frameNo,
+    int regionX,
+    int regionW,
+    bool bufferIsVerticallyFlipped)
+{
+    if (!img || imageW <= 0 || imageH <= 0 || pitch <= 0 || regionW <= 0) {
+        return;
+    }
+
+    const int scale = 2;
+    const int gap = scale;
+    const int margin = 4;
+
+    std::string text = std::to_string(frameNo);
+
+    int digitW = 3 * scale;
+    int digitH = 5 * scale;
+    int textW = int(text.size()) * digitW + int(text.size() - 1) * gap;
+    int textH = digitH;
+
+    int x = regionX + regionW - textW - margin;
+
+    // If the buffer is vertically flipped before Unity displays it,
+    // native bottom becomes visible top.
+    int y = bufferIsVerticallyFlipped
+        ? imageH - margin - textH
+        : margin;
+
+    FillRectBGRA(img, imageW, imageH, pitch,
+        x - 2, y - 2,
+        textW + 4, textH + 4,
+        0, 0, 0, 255);
+
+    int cx = x;
+    for (char c : text) {
+        if (c >= '0' && c <= '9') {
+            DrawDigit3x5BGRA(
+                img, imageW, imageH, pitch,
+                c - '0',
+                cx, y,
+                scale,
+                255, 255, 255,
+                bufferIsVerticallyFlipped
+            );
+        }
+
+        cx += digitW + gap;
+    }
+}
+
 
 extern "C" {
 
@@ -362,111 +500,115 @@ extern "C" {
         return height[index].load();
     }
 
-    static std::array<std::string, 4> videoInfo;
-    static std::array<std::mutex, 4> videoInfoMutex;
-
-    static void SetVideoInfo(int index, std::string text)
+    UNITYDLL_EXPORT void SetBurnInFrameNumber(int index, int enabled)
     {
-        if (index < 0 || index >= (int)videoInfo.size())
-            return;
+        if (index < 0 || index >= 4) return;
 
-        std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
-        videoInfo[index] = std::move(text);
+        burnInFrameNumber[index].store(enabled != 0, std::memory_order_relaxed);
     }
 
-    UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSize) {
-        if (index < 0 || index >= 4 || !buffer || bufferSize <= 0)
-            return;
+    UNITYDLL_EXPORT unsigned long long GetNativeFrameCounter(int index)
+    {
+        if (index < 0 || index >= 4) return 0;
 
-        std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
-
-        strncpy(buffer, videoInfo[index].c_str(), bufferSize - 1);
-        buffer[bufferSize - 1] = '\0';
+        return nativeFrameCounter[index].load(std::memory_order_relaxed);
     }
 
 
-    UNITYDLL_EXPORT void StartCapture(int index, int device_id, int rx_stream_id, int buffer_depth, char inputType, unsigned int requested_width, unsigned int requested_height, unsigned int progressive, unsigned int framerate, VHD_DV_CS cable_color_space, VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard, VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, unsigned int fieldMerge, VHD_BUFFERPACKING buffer_packing)
-    {
-        bool expected = false;
-        if (!running[index].compare_exchange_strong(expected, true)) return; // already running
+UNITYDLL_EXPORT void StartCapture(
+    int index,
+    int device_id,
+    int rx_stream_id,
+    int buffer_depth,
+    char inputType,
+    unsigned int requested_width,
+    unsigned int requested_height,
+    unsigned int progressive,
+    unsigned int framerate,
+    VHD_DV_CS cable_color_space,
+    VHD_DV_SAMPLING cable_sampling,
+    VHD_VIDEOSTANDARD video_standard,
+    VHD_CLOCKDIVISOR clock_divisor,
+    VHD_INTERFACE video_interface,
+    unsigned int fieldMerge,
+    VHD_BUFFERPACKING buffer_packing)
+{
+    if (index < 0 || index >= 4) {
+        return;
+    }
 
-        if (buffer_depth <= 0) {
-            buffer_depth = 8;
-        }
-        //DC_LOG("00");
+    bool expected = false;
+    if (!running[index].compare_exchange_strong(expected, true)) return; // already running
+
+    nativeFrameCounter[index].store(0, std::memory_order_relaxed);
+
+    if (buffer_depth <= 0) {
+        buffer_depth = 8;
+    }
+
         captureThread[index] = std::thread([index, device_id, rx_stream_id, buffer_depth, inputType, requested_width, requested_height, progressive, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMerge, buffer_packing]() {
             bool started = false;
-            //DC_LOG("01");
             try {
                 auto board = Board::open(device_id, nullptr);
-                //DC_LOG("02");
+
                 // open RX tech stream and get base stream
                 auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
                 auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
-                //DC_LOG("03");
+
                 // 1) Wait until a signal is present on the connector
                 if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[index])) {
                     //throw std::runtime_error("No input detected on the requested RX");
                 }
-                //DC_LOG("04");
+
                 // 2) Detect signal information (format, framerate, etc.)
+                
 
                 SignalInformation signal_information;
-                if (inputType == 'S' || inputType == 's') {
+                if (inputType == 'S' || inputType == 's'){
                     signal_information = SdiSignalInformation{ video_standard, clock_divisor, video_interface };
                 }
-                else if(inputType == 'D' || inputType == 'd') {
+                else if(inputType == 'D' || inputType == 'd'){
                     signal_information = DvSignalInformation{ requested_width, requested_height, progressive != 0, framerate, cable_color_space, cable_sampling };
 
                 }
                 else {// prefered inputType == 'A'
                     signal_information = Application::Helper::detect_information(rx_tech_stream);
                 }
-                //DC_LOG("05");
                 auto vc = Application::Helper::get_video_characteristics(signal_information);
-                //DC_LOG("06");
                 int W = vc.width;
                 int H = vc.height;
-                //DC_LOG("07");
                 width[index].store(W);
                 height[index].store(H);
-                //DC_LOG("08");
-                // Make info of the signal available as simple string
-                SetVideoInfo(index, Application::Helper::get_information_string(signal_information, "[Video] "));
-                //DC_LOG("10");
-                
 
                 // 3) Queue depth & packing
                 rx_stream.buffer_queue().set_depth(buffer_depth);
                 rx_stream.set_buffer_packing(buffer_packing);
-                //DC_LOG("11");
 
                 //field merge necesary for example in stereo dual stream
                 DC_LOG("fieldMerge=" + std::to_string(fieldMerge));
                 if (fieldMerge != 0) {
                     rx_stream.enable_field_merge();
                 }
-                //DC_LOG("12");
+
                 // 4) Configure stream to match the detected signal
                 Application::Helper::configure_stream(rx_tech_stream, signal_information);
-                //DC_LOG("13");
+
 
 
                 // 5) Start the stream
                 rx_stream.start();
-                //DC_LOG("14");
+
                 started = true;
 
                 bgra[index].resize(size_t(width[index]) * height[index] * 4);
-                //DC_LOG("15");
+
                 DC_LOG("width=" + std::to_string(width[index]));
                 DC_LOG("height=" + std::to_string(height[index]));
-                //DC_LOG("16");
+
                 while (running[index].load()) {
                     if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[index])) {
                         continue;
                     }
-                    //DC_LOG("17");
                     // If signal changes mid-run, reconfigure
                     auto cur = Application::Helper::detect_information(rx_tech_stream);
                     if (cur != signal_information) {
@@ -474,50 +616,50 @@ extern "C" {
                             rx_stream.stop();
                             started = false; 
                         }
-                        //DC_LOG("18");
                         signal_information = cur;
-                        //DC_LOG("19");
-                        SetVideoInfo(index, Application::Helper::get_information_string(signal_information, "[Video] "));
-                        //DC_LOG("21");
-
                         vc = Application::Helper::get_video_characteristics(signal_information);
                         W = vc.width;
                         H = vc.height;
-                        //DC_LOG("22");
                         width[index].store(W);
                         height[index].store(H);
-                        //DC_LOG("25");
                         bgra[index].resize(size_t(W) * H * 4);
-                        //DC_LOG("24");
+
                         rx_stream.buffer_queue().set_depth(buffer_depth);
-                        //DC_LOG("25");
                         rx_stream.set_buffer_packing(buffer_packing);
-                        //DC_LOG("26");
                         Application::Helper::configure_stream(rx_tech_stream, signal_information);
-                        //DC_LOG("27");
                         rx_stream.start();
-                        //DC_LOG("28");
                         started = true;
                         continue;
                     }
-                    //DC_LOG("29");
                     auto slot = rx_stream.pop_slot();
                     auto [src, totalBytes] = slot->video().buffer();
-                    //DC_LOG("30");
                     // derive source pitch (handles driver alignment)
                     if (height[index] <= 0) {
                         continue;
                     }
-                    //DC_LOG("31");
                     int srcPitch = int(totalBytes / height[index]);   // sanity: if (totalBytes % H) -> alignment mismatch
                     int dstPitch = width[index] * 4;
-                    //DC_LOG("32");
+
                     UYVY_to_BGRA(src, srcPitch, bgra[index].data(), dstPitch, width[index], height[index], true);
+                    const unsigned long long frameNo =
+                        nativeFrameCounter[index].fetch_add(1, std::memory_order_relaxed) + 1;
+
+                    if (burnInFrameNumber[index].load(std::memory_order_relaxed)) {
+                        BurnFrameNumberBGRA(
+                            bgra[index].data(),
+                            width[index],
+                            height[index],
+                            dstPitch,
+                            frameNo,
+                            0,
+                            width[index],
+                            true
+                        );
+                    }
                     {
                         std::lock_guard<std::mutex> lock(frameMutex[index]);
                         latestFrame[index] = bgra[index];  // hand BGRA to Unity
                     }
-                    //DC_LOG("32");
                     //log("running");
                 }
                 if (started) {
@@ -532,8 +674,6 @@ extern "C" {
             catch (const std::exception& e) {
                 DC_LOG(std::string("std::exception: ") + e.what());
             }
-            //DC_LOG("33");
-            SetVideoInfo(index, "Stopped");
             });
     }
 
@@ -664,15 +804,16 @@ extern "C" {
     //        });
     //}
 
-    [[deprecated]]
-    UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth)
-    {
-        bool expected = false;
-        if (!running[0].compare_exchange_strong(expected, true)) return; // already running
+UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth)
+{
+    bool expected = false;
+    if (!running[0].compare_exchange_strong(expected, true)) return; // already running
 
-        if (buffer_depth <= 0) {
-            buffer_depth = 8;
-        }
+    nativeFrameCounter[0].store(0, std::memory_order_relaxed);
+
+    if (buffer_depth <= 0) {
+        buffer_depth = 8;
+    }
 
         captureThread[0] = std::thread([device_id, rx_stream_id, buffer_depth]() {
             bool started = false;
@@ -794,6 +935,36 @@ extern "C" {
                         bgra[1].data(), W2, H2, dstPitch2,
                         sbsBGRA.data(), outW, outH, topFieldFirst);
 
+                    const unsigned long long frameNo =
+                        nativeFrameCounter[0].fetch_add(1, std::memory_order_relaxed) + 1;
+
+                    if (burnInFrameNumber[0].load(std::memory_order_relaxed)) {
+                        const int outPitch = outW * 4;
+
+                        // Burn into upper-right corner of the left eye.
+                        BurnFrameNumberBGRA(
+                            sbsBGRA.data(),
+                            outW,
+                            outH,
+                            outPitch,
+                            frameNo,
+                            0,
+                            W,
+                            true
+                        );
+
+                        // Burn the same number into upper-right corner of the right eye.
+                        BurnFrameNumberBGRA(
+                            sbsBGRA.data(),
+                            outW,
+                            outH,
+                            outPitch,
+                            frameNo,
+                            W,
+                            W2,
+                            true
+                        );
+                    }
                     // publish the single combined frame
                     {
                         std::lock_guard<std::mutex> lock(frameMutex[0]);
@@ -828,8 +999,6 @@ extern "C" {
         if (captureThread[index].joinable()) {
             captureThread[index].join();
         }
-        std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
-        videoInfo[index] = "Stopped";
     }
 
     //UNITYDLL_EXPORT void StopCapture2()

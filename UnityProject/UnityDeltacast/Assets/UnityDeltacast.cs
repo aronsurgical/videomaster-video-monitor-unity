@@ -36,6 +36,10 @@ public class UnityDeltacast : MonoBehaviour {
     public bool showDebug = false;
 
     public int captureIndex = 0;
+
+    public bool burnInFrameNumber = false;
+
+
     public void connectDeltacast() {
         if(readCameraName) {
             if(cameraName != null && cameraName.StartsWith("DELTACAST")) {
@@ -81,6 +85,7 @@ public class UnityDeltacast : MonoBehaviour {
             deltacastAdapter.captureIndex = this.captureIndex;
 
 
+            deltacastAdapter.burnInFrameNumber = this.burnInFrameNumber;
 
 
             deltacastAdapter.Init();
@@ -99,6 +104,7 @@ public class UnityDeltacast : MonoBehaviour {
     }
     void Update() {
         if(cameraName != null && cameraName.StartsWith("DELTACAST") && deltacastAdapter != null && deltacastAdapter.initialized) {
+            deltacastAdapter.burnInFrameNumber = this.burnInFrameNumber;
             deltacastAdapter.Update();
         }
     }

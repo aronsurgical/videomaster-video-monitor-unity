@@ -22,6 +22,12 @@ public class DeltacastAdapter {
     [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern int GetFrame(int index, IntPtr dst, int maxSize);
     //[DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)] private static extern int GetFrame2(IntPtr dst, int maxSize);
 
+    [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)]
+    private static extern void SetBurnInFrameNumber(int index, int enabled);
+
+    [DllImport(DLL_NAME, CallingConvention = CallingConvention.Cdecl)]
+    private static extern ulong GetNativeFrameCounter(int index);
+
     public Texture2D tex;
 
     private byte[] buffer;
@@ -57,6 +63,10 @@ public class DeltacastAdapter {
     public bool showDebug = false;
     public int captureIndex = 0;
 
+    public bool burnInFrameNumber = false;
+
+    private bool lastBurnInFrameNumber = false;
+
     public void Init() {
         if(initialized) {
             Stop();
@@ -91,9 +101,10 @@ public class DeltacastAdapter {
         }
 
 
+        SetBurnInFrameNumber(captureIndex, burnInFrameNumber ? 1 : 0);
+        lastBurnInFrameNumber = burnInFrameNumber;
 
-
-        if(!(stereoConfig.Equals(StereoConfig.SBSFullWidthLeftOnly) || stereoConfig.Equals(StereoConfig.SBSFullWidthRightOnly))) {
+        if (!(stereoConfig.Equals(StereoConfig.SBSFullWidthLeftOnly) || stereoConfig.Equals(StereoConfig.SBSFullWidthRightOnly))) {
             char dvSdiAutoAsChar;
             if(dvSdiAuto.Equals(VIDEOINPUT.SDI)) {
                 dvSdiAutoAsChar = 'S';
@@ -122,6 +133,12 @@ public class DeltacastAdapter {
         if(!initialized) {
             return 0;
         }
+        if (burnInFrameNumber != lastBurnInFrameNumber)
+        {
+            SetBurnInFrameNumber(captureIndex, burnInFrameNumber ? 1 : 0);
+            lastBurnInFrameNumber = burnInFrameNumber;
+        }
+
         // If native resolution changed, rebuild texture & buffer
         int w = GetWidth(captureIndex);
         int h = GetHeight(captureIndex);
@@ -164,6 +181,9 @@ public class DeltacastAdapter {
             tex.Apply(false, false);
 
         }
+    }
+    public ulong GetNativeFrameNumber() {
+        return GetNativeFrameCounter(captureIndex);
     }
 
     public void Stop() {
