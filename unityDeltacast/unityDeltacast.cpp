@@ -5,6 +5,19 @@
 #include <thread>
 #include <variant>
 #include <mutex>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <sstream>
+#include <array>
+#include <cstring>
+
+// NOMINMAX must be set before any windows.h inclusion so the min/max macros don't clobber
+// the std::min<> used in this file. windows.h itself is included AFTER the VideoMaster headers
+// below (see note there), so define the guard now but defer the include.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 
 #include <VideoMasterCppApi/exception.hpp>
 #include <VideoMasterCppApi/api.hpp>
@@ -14,6 +27,17 @@
 #include <VideoMasterCppApi/helper/sdi.hpp>
 
 #include "../src/helper.hpp"
+
+// Windows process/pipe API for the offloaded ffmpeg recording. Included AFTER the VideoMaster
+// headers on purpose: windows.h #defines `interface` (-> struct) and `GetMessage`, which would
+// otherwise break VideoMaster's headers and collide with our exported GetMessage(). Undef
+// GetMessage right after the include so our exported symbol keeps its name.
+#include <windows.h>
+#include <mmsystem.h>      // timeBeginPeriod / timeEndPeriod
+#pragma comment(lib, "winmm.lib")
+#ifdef GetMessage
+#undef GetMessage
+#endif
 
 // Statement-like macro with file, line, and function
 #define DC_LOG(MSG)                                                        \
@@ -89,6 +113,17 @@ static std::array<std::atomic<unsigned long long>, 4> nativeFrameCounter = {
     std::atomic<unsigned long long>{0},
     std::atomic<unsigned long long>{0}
 };
+
+// Per-stream human-readable signal/video description, exposed via GetSignalAndVideoInfo().
+// (Restored from commit 9a1e1a8, which was dropped by a later merge.)
+static std::array<std::string, 4> videoInfo;
+static std::array<std::mutex, 4>  videoInfoMutex;
+
+static void SetVideoInfo(int index, std::string text) {
+    if (index < 0 || index >= (int)videoInfo.size()) return;
+    std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
+    videoInfo[index] = std::move(text);
+}
 
 
 inline uint8_t clamp8(int x) {
@@ -474,6 +509,228 @@ static void BurnFrameNumberBGRA(uint8_t* img,
 }
 
 
+// ============================ Recording (ffmpeg subprocess) ============================
+//
+// Per-stream recorder. A dedicated writer thread snapshots the already-converted BGRA
+// frame published for `index` (the same buffer Unity displays), paces it at a constant
+// fps, and pipes raw BGRA to an ffmpeg.exe child process. ffmpeg owns segmentation, so
+// each .mov file is exactly fps*segmentSeconds frames (= exactly 1 minute by default).
+// `recordedFrame` is the synchronization currency Unity uses to key its .srt metadata.
+
+struct RecorderCtx {
+    std::atomic<bool> recording{ false };
+    std::thread thread;
+    std::atomic<unsigned long long> recordedFrame{ 0 };
+
+    // configuration captured at StartRecording (read by the writer thread after it starts,
+    // which is synchronized by the std::thread construction that follows the writes)
+    std::string ffmpegExe;
+    std::string outputPattern;
+    std::string encoderArgs;
+    int fps = 30;
+    int segmentSeconds = 60;
+    bool vflip = true;
+
+    // resolution locked once the first frame is available
+    int width = 0;
+    int height = 0;
+};
+
+static RecorderCtx recorders[4];
+
+// Assemble the ffmpeg argument string, identical to the known-good Unity command.
+static std::string BuildFfmpegCommand(const RecorderCtx& r)
+{
+    const std::string defaultEncoder =
+        "-c:v h264_nvenc -preset p1 -rc vbr -cq 22 -pix_fmt yuv420p -g "
+        + std::to_string(r.fps) + " -rgb_mode yuv420";
+    const std::string& encoder = r.encoderArgs.empty() ? defaultEncoder : r.encoderArgs;
+
+    std::ostringstream cmd;
+    cmd << "\"" << r.ffmpegExe << "\""
+        << " -y -f rawvideo -pixel_format bgra"
+        << " -video_size " << r.width << "x" << r.height
+        << " -framerate " << r.fps
+        << " -i -";
+    if (r.vflip) cmd << " -vf vflip";
+    cmd << " " << encoder
+        << " -f segment -segment_time " << r.segmentSeconds
+        << " -reset_timestamps 1 -segment_format mov"
+        << " \"" << r.outputPattern << "\"";
+    return cmd.str();
+}
+
+// Write the whole buffer to the pipe, tolerating partial writes.
+static bool WriteAllToPipe(HANDLE h, const uint8_t* data, size_t size)
+{
+    size_t off = 0;
+    while (off < size) {
+        DWORD chunk = (DWORD)std::min<size_t>(size - off, (size_t)(1u << 20));
+        DWORD written = 0;
+        if (!WriteFile(h, data + off, chunk, &written, nullptr) || written == 0) {
+            return false;
+        }
+        off += written;
+    }
+    return true;
+}
+
+// Launch ffmpeg with stdin = read end of a pipe and stderr/stdout -> a per-stream log file.
+// On success, fills hStdInWr (write end, owned by caller) and pi.
+static bool SpawnFfmpeg(RecorderCtx& r, HANDLE& hStdInWr, PROCESS_INFORMATION& pi)
+{
+    hStdInWr = nullptr;
+    ZeroMemory(&pi, sizeof(pi));
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+
+    HANDLE hStdInRd = nullptr;
+    if (!CreatePipe(&hStdInRd, &hStdInWr, &sa, 0)) {
+        DC_LOG("rec: CreatePipe failed err=" + std::to_string(GetLastError()));
+        return false;
+    }
+    // The write end stays in the parent and must NOT be inherited by the child.
+    SetHandleInformation(hStdInWr, HANDLE_FLAG_INHERIT, 0);
+
+    // ffmpeg's diagnostics go to a log file next to the output (a file, not a pipe, so it
+    // can never deadlock on a full pipe). Fall back to NUL if the log can't be created.
+    const std::string logPath = r.outputPattern + ".ffmpeg.log";
+    HANDLE hLog = CreateFileA(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hLog == INVALID_HANDLE_VALUE) {
+        hLog = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hStdInRd;
+    si.hStdOutput = hLog;
+    si.hStdError = hLog;
+
+    const std::string cmd = BuildFfmpegCommand(r);
+    DC_LOG(std::string("rec: launching ffmpeg: ") + cmd);
+
+    // CreateProcessA needs a writable command-line buffer.
+    std::vector<char> cmdline(cmd.begin(), cmd.end());
+    cmdline.push_back('\0');
+
+    BOOL ok = CreateProcessA(
+        nullptr,            // lpApplicationName null -> search PATH using cmdline's first token
+        cmdline.data(),
+        nullptr, nullptr,
+        TRUE,               // inherit handles (pipe read end + log file)
+        CREATE_NO_WINDOW,
+        nullptr, nullptr,
+        &si, &pi);
+
+    // Parent's copies of the handles handed to the child.
+    CloseHandle(hStdInRd);
+    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+
+    if (!ok) {
+        DC_LOG("rec: CreateProcess(ffmpeg) failed err=" + std::to_string(GetLastError()));
+        CloseHandle(hStdInWr);
+        hStdInWr = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static void RecordWriterLoop(int index)
+{
+    RecorderCtx& r = recorders[index];
+
+    // 1) Wait for capture to publish a frame so we know the resolution.
+    while (r.recording.load(std::memory_order_relaxed)) {
+        int w = width[index].load();
+        int h = height[index].load();
+        if (w > 0 && h > 0) { r.width = w; r.height = h; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!r.recording.load(std::memory_order_relaxed)) return;
+
+    const size_t frameBytes = size_t(r.width) * size_t(r.height) * 4;
+
+    // 2) Launch ffmpeg now that -video_size is known.
+    HANDLE hStdInWr = nullptr;
+    PROCESS_INFORMATION pi{};
+    if (!SpawnFfmpeg(r, hStdInWr, pi)) {
+        r.recording.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    // 3) Constant-fps write loop with gap-fill (repeat last frame) to hold the rate.
+    timeBeginPeriod(1);
+    const auto t0 = std::chrono::steady_clock::now();
+    const double interval = 1.0 / double(r.fps);
+
+    std::vector<uint8_t> last;   // most recent snapshot; reused as the gap-fill source
+    bool haveLast = false;
+    unsigned long long lastCapturedSeen = 0;  // last capture-frame counter we copied
+    unsigned long long nextIdx = 0;
+    bool resolutionChanged = false;
+
+    while (r.recording.load(std::memory_order_relaxed)) {
+        const auto target = t0 + std::chrono::nanoseconds(
+            (long long)(double(nextIdx) * interval * 1e9));
+        std::this_thread::sleep_until(target);
+
+        // Only copy when capture produced a new frame; otherwise reuse `last` (gap-fill) without
+        // taking the lock. nativeFrameCounter is incremented just before each publish, so it's a
+        // cheap, lock-free "new frame available" hint.
+        const unsigned long long captured = nativeFrameCounter[index].load(std::memory_order_relaxed);
+        if (captured != lastCapturedSeen) {
+            std::lock_guard<std::mutex> lk(frameMutex[index]);
+            const size_t avail = latestFrame[index].size();
+            if (avail == frameBytes) {
+                last.assign(latestFrame[index].begin(), latestFrame[index].end());
+                haveLast = true;
+                lastCapturedSeen = captured;
+            }
+            else if (avail != 0) {
+                resolutionChanged = true;  // signal change mid-recording -> stop cleanly
+            }
+        }
+
+        if (resolutionChanged) {
+            DC_LOG("rec: resolution changed mid-recording, stopping index=" + std::to_string(index));
+            break;
+        }
+
+        if (!haveLast) {
+            // No frame captured yet; don't advance the frame index (keeps fps honest).
+            continue;
+        }
+
+        if (!WriteAllToPipe(hStdInWr, last.data(), last.size())) {
+            DC_LOG("rec: pipe write failed (ffmpeg gone?) index=" + std::to_string(index));
+            break;
+        }
+        r.recordedFrame.fetch_add(1, std::memory_order_relaxed);
+        ++nextIdx;
+    }
+
+    timeEndPeriod(1);
+
+    // 4) Teardown: closing stdin tells ffmpeg to flush and finalize the last segment.
+    if (hStdInWr) { CloseHandle(hStdInWr); hStdInWr = nullptr; }
+    if (pi.hProcess) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+    }
+    if (pi.hThread) CloseHandle(pi.hThread);
+
+    r.recording.store(false, std::memory_order_relaxed);
+    DC_LOG("rec: writer finished index=" + std::to_string(index)
+        + " frames=" + std::to_string(r.recordedFrame.load()));
+}
+
+
 extern "C" {
 
     UNITYDLL_EXPORT void InitLibrary() {
@@ -512,6 +769,74 @@ extern "C" {
         if (index < 0 || index >= 4) return 0;
 
         return nativeFrameCounter[index].load(std::memory_order_relaxed);
+    }
+
+    UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSize) {
+        if (index < 0 || index >= 4 || !buffer || bufferSize <= 0)
+            return;
+
+        std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
+
+        strncpy(buffer, videoInfo[index].c_str(), bufferSize - 1);
+        buffer[bufferSize - 1] = '\0';
+    }
+
+    UNITYDLL_EXPORT int StartRecording(int index,
+                                       const char* ffmpegExe,
+                                       const char* outputPattern,
+                                       int fps,
+                                       int segmentSeconds,
+                                       const char* encoderArgs,
+                                       int applyVFlip)
+    {
+        if (index < 0 || index >= 4) return 0;
+        if (!outputPattern || !*outputPattern) return 0;
+        if (fps <= 0) fps = 30;
+        if (segmentSeconds <= 0) segmentSeconds = 60;
+
+        RecorderCtx& r = recorders[index];
+
+        bool expected = false;
+        if (!r.recording.compare_exchange_strong(expected, true)) {
+            return 0; // already recording
+        }
+
+        // A previous session may have stopped on its own (e.g. resolution change) without
+        // StopRecording() being called yet; join its finished thread before reusing the slot.
+        if (r.thread.joinable()) r.thread.join();
+
+        r.recordedFrame.store(0, std::memory_order_relaxed);
+        r.ffmpegExe = (ffmpegExe && *ffmpegExe) ? ffmpegExe : "ffmpeg";
+        r.outputPattern = outputPattern;
+        r.encoderArgs = encoderArgs ? encoderArgs : "";
+        r.fps = fps;
+        r.segmentSeconds = segmentSeconds;
+        r.vflip = (applyVFlip != 0);
+        r.width = 0;
+        r.height = 0;
+
+        r.thread = std::thread(RecordWriterLoop, index);
+        return 1;
+    }
+
+    UNITYDLL_EXPORT void StopRecording(int index)
+    {
+        if (index < 0 || index >= 4) return;
+        RecorderCtx& r = recorders[index];
+        r.recording.store(false, std::memory_order_relaxed);
+        if (r.thread.joinable()) r.thread.join();
+    }
+
+    UNITYDLL_EXPORT int IsRecording(int index)
+    {
+        if (index < 0 || index >= 4) return 0;
+        return recorders[index].recording.load(std::memory_order_relaxed) ? 1 : 0;
+    }
+
+    UNITYDLL_EXPORT unsigned long long GetRecordedFrameNumber(int index)
+    {
+        if (index < 0 || index >= 4) return 0;
+        return recorders[index].recordedFrame.load(std::memory_order_relaxed);
     }
 
 
@@ -580,6 +905,9 @@ UNITYDLL_EXPORT void StartCapture(
                 width[index].store(W);
                 height[index].store(H);
 
+                // Make info of the signal available as a simple string
+                SetVideoInfo(index, Application::Helper::get_information_string(signal_information, "[Video] "));
+
                 // 3) Queue depth & packing
                 rx_stream.buffer_queue().set_depth(buffer_depth);
                 rx_stream.set_buffer_packing(buffer_packing);
@@ -617,6 +945,7 @@ UNITYDLL_EXPORT void StartCapture(
                             started = false; 
                         }
                         signal_information = cur;
+                        SetVideoInfo(index, Application::Helper::get_information_string(signal_information, "[Video] "));
                         vc = Application::Helper::get_video_characteristics(signal_information);
                         W = vc.width;
                         H = vc.height;
@@ -852,6 +1181,9 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                 width[0].store(outW);
                 height[0].store(outH);
 
+                // Make info of the signal available as a simple string (stereo publishes to index 0)
+                SetVideoInfo(0, Application::Helper::get_information_string(signal_information, "[Video] "));
+
                 // allocate working & output buffers
                 bgra[0].resize(size_t(W) * H * 4);
                 bgra[1].resize(size_t(W2) * H2 * 4);
@@ -901,6 +1233,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                         }
                         DC_LOG("6");
                         signal_information = cur;
+                        SetVideoInfo(0, Application::Helper::get_information_string(signal_information, "[Video] "));
                         vc = Application::Helper::get_video_characteristics(signal_information);
                         W = vc.width; H = vc.height;
                         width[0].store(W);
@@ -998,6 +1331,10 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
         running[index].store(false);
         if (captureThread[index].joinable()) {
             captureThread[index].join();
+        }
+        if (index >= 0 && index < 4) {
+            std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
+            videoInfo[index] = "Stopped";
         }
     }
 
