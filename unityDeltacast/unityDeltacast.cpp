@@ -125,6 +125,24 @@ static void SetVideoInfo(int index, std::string text) {
     videoInfo[index] = std::move(text);
 }
 
+// A 1080i50 Level-B dual-stream signal contains 50 temporally distinct fields
+// per second, but only 25 complete interlaced frames. A fieldMerge value of 0
+// selects field mode for this specific signal type so each field can be
+// published as its own bob-deinterlaced, full-height frame. Other signal types
+// retain the old fieldMerge == 0 behavior.
+static bool ShouldUseFieldModeBob(const SignalInformation& signalInformation,
+                                  unsigned int fieldMerge)
+{
+    if (fieldMerge != UNITYDELTACAST_FIELD_MODE_BOB) return false;
+
+    const auto* sdi = std::get_if<SdiSignalInformation>(&signalInformation);
+    if (!sdi
+        || sdi->video_interface != VHD_INTERFACE_3G_B_DS_425_1
+        || sdi->video_standard != VHD_VIDEOSTD_S274M_1080i_50Hz) return false;
+
+    return Application::Helper::get_video_characteristics(signalInformation).interlaced != 0;
+}
+
 
 inline uint8_t clamp8(int x) {
     return (uint8_t)(x < 0 ? 0 : x>255 ? 255 : x);
@@ -160,6 +178,86 @@ static void UYVY_to_BGRA(const uint8_t* src, int srcPitch, uint8_t* dst, int dst
             emit(Y1);
         }
     }
+}
+
+// Convert one packed UYVY field to a full-height BGRA frame using bob
+// deinterlacing. Field lines are copied to their natural parity and the missing
+// lines are interpolated from the nearest captured lines. The SDK returns field
+// lines contiguously; totalBytes may describe either the field payload or a
+// full-frame-sized slot allocation, so derive padding only for a half-frame
+// payload and otherwise use the natural UYVY row size.
+static bool UYVY_Field_to_BGRA_Bob(const uint8_t* src,
+                                   size_t totalBytes,
+                                   uint8_t* dst,
+                                   int dstPitch,
+                                   int W,
+                                   int H,
+                                   bool evenField,
+                                   bool flipY)
+{
+    if (!src || !dst || W <= 0 || H <= 0 || (W & 1) != 0) return false;
+
+    // Field 1/odd carries display rows 0,2,4...; field 2/even carries
+    // display rows 1,3,5... (zero-based row coordinates).
+    const int sourceParity = evenField ? 1 : 0;
+    const int fieldRows = (H - sourceParity + 1) / 2;
+    if (fieldRows <= 0) return false;
+
+    const size_t rowBytes = size_t(W) * 2; // UYVY 4:2:2 8-bit
+    const size_t minimumFieldBytes = rowBytes * size_t(fieldRows);
+    if (totalBytes < minimumFieldBytes) return false;
+
+    size_t srcPitch = rowBytes;
+    const size_t minimumFrameBytes = rowBytes * size_t(H);
+    if (totalBytes < minimumFrameBytes && totalBytes % size_t(fieldRows) == 0) {
+        const size_t candidatePitch = totalBytes / size_t(fieldRows);
+        if (candidatePitch >= rowBytes) srcPitch = candidatePitch;
+    }
+
+    if ((size_t(fieldRows - 1) * srcPitch) + rowBytes > totalBytes) return false;
+
+    // Convert every real field line into its full-frame row.
+    for (int fieldY = 0; fieldY < fieldRows; ++fieldY) {
+        const int sourceFrameY = fieldY * 2 + sourceParity;
+        const int outputY = flipY ? (H - 1 - sourceFrameY) : sourceFrameY;
+
+        UYVY_to_BGRA(
+            src + size_t(fieldY) * srcPitch,
+            int(srcPitch),
+            dst + size_t(outputY) * dstPitch,
+            dstPitch,
+            W,
+            1,
+            false);
+    }
+
+    // Vertical flipping reverses line parity when the output height is even.
+    const int outputFieldParity = flipY ? ((H - 1 - sourceParity) & 1) : sourceParity;
+    const int rowBytesBGRA = W * 4;
+
+    for (int y = 0; y < H; ++y) {
+        if ((y & 1) == outputFieldParity) continue;
+
+        int upY = y - 1;
+        int downY = y + 1;
+        if (upY < 0) upY = downY;
+        if (downY >= H) downY = upY;
+
+        uint8_t* out = dst + size_t(y) * dstPitch;
+        const uint8_t* up = dst + size_t(upY) * dstPitch;
+        const uint8_t* down = dst + size_t(downY) * dstPitch;
+
+        if (upY == downY) {
+            std::memcpy(out, up, rowBytesBGRA);
+        }
+        else {
+            for (int i = 0; i < rowBytesBGRA; ++i) {
+                out[i] = uint8_t((int(up[i]) + int(down[i])) >> 1);
+            }
+        }
+    }
+
+    return true;
 }
 
 //using TechStream = std::variant<Deltacast::Wrapper::SdiStream, Deltacast::Wrapper::DvStream>;
@@ -681,9 +779,9 @@ static void RecordWriterLoop(int index)
         std::this_thread::sleep_until(target);
 
         // Only copy when capture produced a new frame; otherwise reuse `last` (gap-fill) without
-        // taking the lock. nativeFrameCounter is incremented just before each publish, so it's a
-        // cheap, lock-free "new frame available" hint.
-        const unsigned long long captured = nativeFrameCounter[index].load(std::memory_order_relaxed);
+        // taking the lock. nativeFrameCounter is updated immediately after each publish, so its
+        // release/acquire ordering makes it a cheap, lock-free "new frame available" signal.
+        const unsigned long long captured = nativeFrameCounter[index].load(std::memory_order_acquire);
         if (captured != lastCapturedSeen) {
             std::lock_guard<std::mutex> lk(frameMutex[index]);
             const size_t avail = latestFrame[index].size();
@@ -912,14 +1010,26 @@ UNITYDLL_EXPORT void StartCapture(
                 rx_stream.buffer_queue().set_depth(buffer_depth);
                 rx_stream.set_buffer_packing(buffer_packing);
 
-                //field merge necesary for example in stereo dual stream
+                // Preserve the existing merged-frame behavior for fieldMerge != 0.
+                // For an interlaced Level-B dual stream, fieldMerge == 0 selects
+                // field mode and publishes one bob-deinterlaced frame per field.
                 DC_LOG("fieldMerge=" + std::to_string(fieldMerge));
                 if (fieldMerge != 0) {
                     rx_stream.enable_field_merge();
                 }
 
+                bool useFieldModeBob = ShouldUseFieldModeBob(signal_information, fieldMerge);
+
                 // 4) Configure stream to match the detected signal
                 Application::Helper::configure_stream(rx_tech_stream, signal_information);
+
+                if (useFieldModeBob) {
+                    if (!board.supports_field_mode()) {
+                        throw std::runtime_error("The selected DELTACAST board does not support field mode");
+                    }
+                    rx_stream.enable_field_mode();
+                    DC_LOG("field mode bob enabled");
+                }
 
 
 
@@ -955,23 +1065,58 @@ UNITYDLL_EXPORT void StartCapture(
 
                         rx_stream.buffer_queue().set_depth(buffer_depth);
                         rx_stream.set_buffer_packing(buffer_packing);
+
+                        const bool newUseFieldModeBob = ShouldUseFieldModeBob(signal_information, fieldMerge);
+                        if (useFieldModeBob && !newUseFieldModeBob) {
+                            rx_stream.disable_field_mode();
+                        }
+
                         Application::Helper::configure_stream(rx_tech_stream, signal_information);
+
+                        if (!useFieldModeBob && newUseFieldModeBob) {
+                            if (!board.supports_field_mode()) {
+                                throw std::runtime_error("The selected DELTACAST board does not support field mode");
+                            }
+                            rx_stream.enable_field_mode();
+                        }
+                        useFieldModeBob = newUseFieldModeBob;
+
                         rx_stream.start();
                         started = true;
                         continue;
                     }
                     auto slot = rx_stream.pop_slot();
                     auto [src, totalBytes] = slot->video().buffer();
-                    // derive source pitch (handles driver alignment)
                     if (height[index] <= 0) {
                         continue;
                     }
-                    int srcPitch = int(totalBytes / height[index]);   // sanity: if (totalBytes % H) -> alignment mismatch
                     int dstPitch = width[index] * 4;
 
-                    UYVY_to_BGRA(src, srcPitch, bgra[index].data(), dstPitch, width[index], height[index], true);
+                    if (useFieldModeBob) {
+                        const bool evenField = (slot->parity() == Slot::Parity::EVEN);
+                        if (!UYVY_Field_to_BGRA_Bob(
+                                src,
+                                totalBytes,
+                                bgra[index].data(),
+                                dstPitch,
+                                width[index],
+                                height[index],
+                                evenField,
+                                true)) {
+                            DC_LOG("field mode bob: unexpected field buffer size="
+                                + std::to_string(totalBytes));
+                            continue;
+                        }
+                    }
+                    else {
+                        // Derive source pitch for the legacy full-frame path.
+                        int srcPitch = int(totalBytes / height[index]);
+                        UYVY_to_BGRA(src, srcPitch, bgra[index].data(), dstPitch,
+                            width[index], height[index], true);
+                    }
+
                     const unsigned long long frameNo =
-                        nativeFrameCounter[index].fetch_add(1, std::memory_order_relaxed) + 1;
+                        nativeFrameCounter[index].load(std::memory_order_relaxed) + 1;
 
                     if (burnInFrameNumber[index].load(std::memory_order_relaxed)) {
                         BurnFrameNumberBGRA(
@@ -989,6 +1134,11 @@ UNITYDLL_EXPORT void StartCapture(
                         std::lock_guard<std::mutex> lock(frameMutex[index]);
                         latestFrame[index] = bgra[index];  // hand BGRA to Unity
                     }
+
+                    // Publish the counter only after latestFrame is complete. The recorder's
+                    // acquire load then cannot associate a new counter with the old pixels.
+                    nativeFrameCounter[index].store(frameNo, std::memory_order_release);
+
                     //log("running");
                 }
                 if (started) {

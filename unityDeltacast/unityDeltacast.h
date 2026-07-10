@@ -6,6 +6,14 @@
 #  define UNITYDLL_EXPORT
 #endif
 
+// StartCapture fieldMerge values. Existing field-merged calls keep using 1.
+// For a 1080i50 SMPTE 425-1 Level-B dual-stream input, 0 selects SDK field
+// mode and expands every captured field to a full-height frame with bob
+// deinterlacing. For other input formats, 0 retains the previous unmerged frame
+// behavior.
+#define UNITYDELTACAST_FIELD_MODE_BOB 0u
+#define UNITYDELTACAST_FIELD_MERGE    1u
+
 // C API: functions must be extern "C" to avoid C++ name mangling
 extern "C" {
 
