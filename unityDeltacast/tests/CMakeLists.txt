@@ -1,0 +1,11 @@
+add_executable(capture_state_tests capture_state_tests.cpp)
+target_compile_features(capture_state_tests PRIVATE cxx_std_17)
+add_test(NAME capture_state_tests COMMAND capture_state_tests)
+
+add_executable(unity_deltacast_api_tests api_tests.cpp)
+target_include_directories(unity_deltacast_api_tests PRIVATE "${VM_INCLUDE_C}")
+target_link_libraries(unity_deltacast_api_tests PRIVATE unityDeltacast)
+set_target_properties(unity_deltacast_api_tests PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME unity_deltacast_api_tests COMMAND unity_deltacast_api_tests)
+set_tests_properties(capture_state_tests unity_deltacast_api_tests PROPERTIES TIMEOUT 15)

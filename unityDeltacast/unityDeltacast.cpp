@@ -1,4 +1,5 @@
 #include "unityDeltacast.h"
+#include "capture_state.hpp"
 
 #include <string>
 #include <atomic>
@@ -64,11 +65,7 @@ using namespace Deltacast::Wrapper;
 //static std::mutex frameMutex2;
 
 
-static std::atomic<bool> running[4] = { false, false, false, false };
-static std::thread captureThread[4];
-
-static std::vector<uint8_t> latestFrame[4];
-static std::mutex frameMutex[4];
+static deltacast::PublishedFrame publishedFrames[4];
 
 
 
@@ -107,12 +104,7 @@ static std::array<std::atomic<bool>, 4> burnInFrameNumber = {
     std::atomic<bool>{false}
 };
 
-static std::array<std::atomic<unsigned long long>, 4> nativeFrameCounter = {
-    std::atomic<unsigned long long>{0},
-    std::atomic<unsigned long long>{0},
-    std::atomic<unsigned long long>{0},
-    std::atomic<unsigned long long>{0}
-};
+
 
 // Per-stream human-readable signal/video description, exposed via GetSignalAndVideoInfo().
 // (Restored from commit 9a1e1a8, which was dropped by a later merge.)
@@ -262,7 +254,7 @@ static bool UYVY_Field_to_BGRA_Bob(const uint8_t* src,
 
 //using TechStream = std::variant<Deltacast::Wrapper::SdiStream, Deltacast::Wrapper::DvStream>;
 
-static std::vector<uint8_t> sbsBGRA;  // combined (left|right) output
+
 
 // copy left & right BGRA images into a single side-by-side BGRA
 static void PackSideBySide_BGRA(const uint8_t* left, int LW, int LH, int LPitch,
@@ -635,6 +627,8 @@ struct RecorderCtx {
 };
 
 static RecorderCtx recorders[4];
+static std::mutex recordingLifecycle[4];
+static deltacast::CaptureWorker captureWorkers[4];
 
 // Assemble the ffmpeg argument string, identical to the known-good Unity command.
 static std::string BuildFfmpegCommand(const RecorderCtx& r)
@@ -769,7 +763,7 @@ static void RecordWriterLoop(int index)
 
     std::vector<uint8_t> last;   // most recent snapshot; reused as the gap-fill source
     bool haveLast = false;
-    unsigned long long lastCapturedSeen = 0;  // last capture-frame counter we copied
+    uint64_t lastCapturedSeen = 0;  // last capture-frame counter we copied
     unsigned long long nextIdx = 0;
     bool resolutionChanged = false;
 
@@ -778,22 +772,9 @@ static void RecordWriterLoop(int index)
             (long long)(double(nextIdx) * interval * 1e9));
         std::this_thread::sleep_until(target);
 
-        // Only copy when capture produced a new frame; otherwise reuse `last` (gap-fill) without
-        // taking the lock. nativeFrameCounter is updated immediately after each publish, so its
-        // release/acquire ordering makes it a cheap, lock-free "new frame available" signal.
-        const unsigned long long captured = nativeFrameCounter[index].load(std::memory_order_acquire);
-        if (captured != lastCapturedSeen) {
-            std::lock_guard<std::mutex> lk(frameMutex[index]);
-            const size_t avail = latestFrame[index].size();
-            if (avail == frameBytes) {
-                last.assign(latestFrame[index].begin(), latestFrame[index].end());
-                haveLast = true;
-                lastCapturedSeen = captured;
-            }
-            else if (avail != 0) {
-                resolutionChanged = true;  // signal change mid-recording -> stop cleanly
-            }
-        }
+        const auto snapshot = publishedFrames[index].copy_new(lastCapturedSeen, frameBytes, last);
+        if (snapshot == deltacast::SnapshotResult::Copied) haveLast = true;
+        if (snapshot == deltacast::SnapshotResult::SizeChanged) resolutionChanged = true;
 
         if (resolutionChanged) {
             DC_LOG("rec: resolution changed mid-recording, stopping index=" + std::to_string(index));
@@ -840,7 +821,7 @@ extern "C" {
     }
 
     UNITYDLL_EXPORT const char* GetMessage() {
-        static std::string last;
+        thread_local std::string last;
         std::lock_guard<std::mutex> lk(messageMutex);
         last = message;
         message.clear();
@@ -848,11 +829,11 @@ extern "C" {
     }
 
     UNITYDLL_EXPORT int GetWidth(int index) {
-        return width[index].load();
+        return deltacast::valid_index(index) ? width[index].load() : 0;
     }
 
     UNITYDLL_EXPORT int GetHeight(int index) {
-        return height[index].load();
+        return deltacast::valid_index(index) ? height[index].load() : 0;
     }
 
     UNITYDLL_EXPORT void SetBurnInFrameNumber(int index, int enabled)
@@ -866,7 +847,7 @@ extern "C" {
     {
         if (index < 0 || index >= 4) return 0;
 
-        return nativeFrameCounter[index].load(std::memory_order_relaxed);
+        return publishedFrames[index].sequence();
     }
 
     UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSize) {
@@ -892,6 +873,7 @@ extern "C" {
         if (fps <= 0) fps = 30;
         if (segmentSeconds <= 0) segmentSeconds = 60;
 
+        std::lock_guard<std::mutex> lifecycle(recordingLifecycle[index]);
         RecorderCtx& r = recorders[index];
 
         bool expected = false;
@@ -899,6 +881,7 @@ extern "C" {
             return 0; // already recording
         }
 
+        try {
         // A previous session may have stopped on its own (e.g. resolution change) without
         // StopRecording() being called yet; join its finished thread before reusing the slot.
         if (r.thread.joinable()) r.thread.join();
@@ -915,11 +898,16 @@ extern "C" {
 
         r.thread = std::thread(RecordWriterLoop, index);
         return 1;
+        } catch (...) {
+            r.recording.store(false);
+            return 0;
+        }
     }
 
     UNITYDLL_EXPORT void StopRecording(int index)
     {
         if (index < 0 || index >= 4) return;
+        std::lock_guard<std::mutex> lifecycle(recordingLifecycle[index]);
         RecorderCtx& r = recorders[index];
         r.recording.store(false, std::memory_order_relaxed);
         if (r.thread.joinable()) r.thread.join();
@@ -960,16 +948,24 @@ UNITYDLL_EXPORT void StartCapture(
         return;
     }
 
-    bool expected = false;
-    if (!running[index].compare_exchange_strong(expected, true)) return; // already running
-
-    nativeFrameCounter[index].store(0, std::memory_order_relaxed);
+    if (buffer_packing != VHD_BUFPACK_VIDEO_YUV422_8) {
+        SetVideoInfo(index, "Unsupported buffer packing: UYVY8 required");
+        return;
+    }
+    std::lock_guard<std::mutex> lifecycle(recordingLifecycle[index]);
+    if (recorders[index].recording.load()) return;
 
     if (buffer_depth <= 0) {
         buffer_depth = 8;
     }
 
-        captureThread[index] = std::thread([index, device_id, rx_stream_id, buffer_depth, inputType, requested_width, requested_height, progressive, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMerge, buffer_packing]() {
+    try {
+        captureWorkers[index].start([index] {
+            publishedFrames[index].reset();
+            width[index].store(0);
+            height[index].store(0);
+            SetVideoInfo(index, "Starting");
+        }, [index, device_id, rx_stream_id, buffer_depth, inputType, requested_width, requested_height, progressive, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMerge, buffer_packing]() {
             bool started = false;
             try {
                 auto board = Board::open(device_id, nullptr);
@@ -979,7 +975,7 @@ UNITYDLL_EXPORT void StartCapture(
                 auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
 
                 // 1) Wait until a signal is present on the connector
-                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[index])) {
+                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[index].running)) {
                     //throw std::runtime_error("No input detected on the requested RX");
                 }
 
@@ -1043,8 +1039,8 @@ UNITYDLL_EXPORT void StartCapture(
                 DC_LOG("width=" + std::to_string(width[index]));
                 DC_LOG("height=" + std::to_string(height[index]));
 
-                while (running[index].load()) {
-                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[index])) {
+                while (captureWorkers[index].running.load()) {
+                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[index].running)) {
                         continue;
                     }
                     // If signal changes mid-run, reconfigure
@@ -1116,7 +1112,7 @@ UNITYDLL_EXPORT void StartCapture(
                     }
 
                     const unsigned long long frameNo =
-                        nativeFrameCounter[index].load(std::memory_order_relaxed) + 1;
+                        publishedFrames[index].sequence() + 1;
 
                     if (burnInFrameNumber[index].load(std::memory_order_relaxed)) {
                         BurnFrameNumberBGRA(
@@ -1130,14 +1126,7 @@ UNITYDLL_EXPORT void StartCapture(
                             true
                         );
                     }
-                    {
-                        std::lock_guard<std::mutex> lock(frameMutex[index]);
-                        latestFrame[index] = bgra[index];  // hand BGRA to Unity
-                    }
-
-                    // Publish the counter only after latestFrame is complete. The recorder's
-                    // acquire load then cannot associate a new counter with the old pixels.
-                    nativeFrameCounter[index].store(frameNo, std::memory_order_release);
+                    publishedFrames[index].publish(bgra[index]);
 
                     //log("running");
                 }
@@ -1148,13 +1137,20 @@ UNITYDLL_EXPORT void StartCapture(
                 DC_LOG("finished");
             }
             catch (const ApiException& e) {
+                SetVideoInfo(index, std::string("Capture failed: ") + e.what());
                 DC_LOG(std::string("ApiException: ") + e.what());
             }
             catch (const std::exception& e) {
+                SetVideoInfo(index, std::string("Capture failed: ") + e.what());
                 DC_LOG(std::string("std::exception: ") + e.what());
             }
             });
+    } catch (const std::exception& e) {
+        SetVideoInfo(index, std::string("Capture start failed: ") + e.what());
+    } catch (...) {
+        SetVideoInfo(index, "Capture start failed");
     }
+}
 
     ////AW: HACK!!! remember to always use both methods
     //UNITYDLL_EXPORT void StartCapture2(int device_id, int rx_stream_id, int buffer_depth, char inputType, unsigned int requested_width, unsigned int requested_height, unsigned int progressive, unsigned int framerate, VHD_DV_CS cable_color_space, VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard, VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, unsigned int fieldMerge, VHD_BUFFERPACKING buffer_packing)
@@ -1285,17 +1281,23 @@ UNITYDLL_EXPORT void StartCapture(
 
 UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth)
 {
-    bool expected = false;
-    if (!running[0].compare_exchange_strong(expected, true)) return; // already running
-
-    nativeFrameCounter[0].store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lifecycle(recordingLifecycle[0]);
+    if (recorders[0].recording.load()) return;
 
     if (buffer_depth <= 0) {
         buffer_depth = 8;
     }
 
-        captureThread[0] = std::thread([device_id, rx_stream_id, buffer_depth]() {
+    try {
+        captureWorkers[0].start([] {
+            publishedFrames[0].reset();
+            width[0].store(0);
+            height[0].store(0);
+            SetVideoInfo(0, "Starting");
+        }, [device_id, rx_stream_id, buffer_depth]() {
             bool started = false;
+            std::array<std::vector<uint8_t>, 2> bgra;
+            std::vector<uint8_t> sbsBGRA;
             try {
                 auto board = Board::open(device_id, nullptr);
                 DC_LOG("0");
@@ -1306,7 +1308,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                 auto& rx_stream2 = Application::Helper::to_base_stream(rx_tech_stream2);
                 DC_LOG("1");
                 // 1) Wait until a signal is present on the connector
-                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[0])) {
+                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[0].running)) {
                     throw std::runtime_error("No input detected on the requested RX");
                 }
                 DC_LOG("2");
@@ -1325,8 +1327,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                 int W = vc.width, H = vc.height;
                 int W2 = vc2.width, H2 = vc2.height;
 
-                int outW = W + W2;
-                int outH = (H > H2) ? H : H2;
+                auto [outW, outH] = deltacast::stereo_extent(W, H, W2, H2);
 
                 width[0].store(outW);
                 height[0].store(outH);
@@ -1369,8 +1370,8 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
 
                 started = true;
 
-                while (running[0].load()) {
-                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[0])) {
+                while (captureWorkers[0].running.load()) {
+                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[0].running)) {
                         continue;
                     }
                     DC_LOG("6");
@@ -1386,9 +1387,13 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                         SetVideoInfo(0, Application::Helper::get_information_string(signal_information, "[Video] "));
                         vc = Application::Helper::get_video_characteristics(signal_information);
                         W = vc.width; H = vc.height;
-                        width[0].store(W);
-                        height[0].store(H);
+                        const auto extent = deltacast::stereo_extent(W, H, W2, H2);
+                        outW = extent.first;
+                        outH = extent.second;
+                        width[0].store(outW);
+                        height[0].store(outH);
                         bgra[0].resize(size_t(W) * H * 4);
+                        sbsBGRA.resize(size_t(outW) * outH * 4);
 
                         rx_stream.buffer_queue().set_depth(buffer_depth);
                         rx_stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
@@ -1419,7 +1424,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                         sbsBGRA.data(), outW, outH, topFieldFirst);
 
                     const unsigned long long frameNo =
-                        nativeFrameCounter[0].fetch_add(1, std::memory_order_relaxed) + 1;
+                        publishedFrames[0].sequence() + 1;
 
                     if (burnInFrameNumber[0].load(std::memory_order_relaxed)) {
                         const int outPitch = outW * 4;
@@ -1449,10 +1454,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                         );
                     }
                     // publish the single combined frame
-                    {
-                        std::lock_guard<std::mutex> lock(frameMutex[0]);
-                        latestFrame[0] = sbsBGRA;
-                    }
+                    publishedFrames[0].publish(sbsBGRA);
 
 
                     //log("running");
@@ -1467,25 +1469,26 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                 DC_LOG("finished");
             }
             catch (const ApiException& e) {
+                SetVideoInfo(0, std::string("Capture failed: ") + e.what());
                 DC_LOG(std::string("ApiException: ") + e.what());
             }
             catch (const std::exception& e) {
+                SetVideoInfo(0, std::string("Capture failed: ") + e.what());
                 DC_LOG(std::string("std::exception: ") + e.what());
             }
             });
+    } catch (const std::exception& e) {
+        SetVideoInfo(0, std::string("Capture start failed: ") + e.what());
+    } catch (...) {
+        SetVideoInfo(0, "Capture start failed");
     }
+}
 
 
     UNITYDLL_EXPORT void StopCapture(int index)
     {
-        running[index].store(false);
-        if (captureThread[index].joinable()) {
-            captureThread[index].join();
-        }
-        if (index >= 0 && index < 4) {
-            std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
-            videoInfo[index] = "Stopped";
-        }
+        if (!deltacast::valid_index(index)) return;
+        captureWorkers[index].stop([index] { SetVideoInfo(index, "Stopped"); });
     }
 
     //UNITYDLL_EXPORT void StopCapture2()
@@ -1498,12 +1501,8 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
 
     UNITYDLL_EXPORT int GetFrame(int index, uint8_t* dst, int maxSize)
     {
-        std::lock_guard<std::mutex> lk(frameMutex[index]);
-        int n = std::min<int>(maxSize, latestFrame[index].size());
-        if (n > 0) {
-            std::memcpy(dst, latestFrame[index].data(), n);
-        }
-        return n;
+        if (!deltacast::valid_index(index)) return 0;
+        return publishedFrames[index].copy(dst, maxSize);
     }
 
     //UNITYDLL_EXPORT int GetFrame2(uint8_t* dst, int maxSize)

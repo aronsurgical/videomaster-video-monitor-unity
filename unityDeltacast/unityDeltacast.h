@@ -1,7 +1,16 @@
 #pragma once
 
+#include <stdint.h>
+#include <VideoMasterHD_Core.h>
+#include <VideoMasterHD_Dv.h>
+#include <VideoMasterHD_Sdi.h>
+
 #ifdef _WIN32
-#  define UNITYDLL_EXPORT __declspec(dllexport)
+#  ifdef UNITYDELTACAST_BUILD
+#    define UNITYDLL_EXPORT __declspec(dllexport)
+#  else
+#    define UNITYDLL_EXPORT __declspec(dllimport)
+#  endif
 #else
 #  define UNITYDLL_EXPORT
 #endif
@@ -15,7 +24,24 @@
 #define UNITYDELTACAST_FIELD_MERGE    1u
 
 // C API: functions must be extern "C" to avoid C++ name mangling
+#ifdef __cplusplus
 extern "C" {
+#endif
+
+UNITYDLL_EXPORT void StartCapture(int index, int device_id, int rx_stream_id, int buffer_depth,
+    char inputType, unsigned int requested_width, unsigned int requested_height,
+    unsigned int progressive, unsigned int framerate, VHD_DV_CS cable_color_space,
+    VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard,
+    VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, unsigned int fieldMerge,
+    VHD_BUFFERPACKING buffer_packing);
+UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth);
+UNITYDLL_EXPORT void StopCapture(int index);
+UNITYDLL_EXPORT int GetWidth(int index);
+UNITYDLL_EXPORT int GetHeight(int index);
+// Returns the whole frame size, or zero without writing if unavailable or too small.
+UNITYDLL_EXPORT int GetFrame(int index, uint8_t* dst, int maxSize);
+UNITYDLL_EXPORT unsigned long long GetNativeFrameCounter(int index);
+UNITYDLL_EXPORT void SetBurnInFrameNumber(int index, int enabled);
 
 // Example: initialize something
 UNITYDLL_EXPORT void InitLibrary();
@@ -58,4 +84,6 @@ UNITYDLL_EXPORT int IsRecording(int index);
 // This is the shared synchronization currency for Unity's .srt metadata.
 UNITYDLL_EXPORT unsigned long long GetRecordedFrameNumber(int index);
 
+#ifdef __cplusplus
 }
+#endif

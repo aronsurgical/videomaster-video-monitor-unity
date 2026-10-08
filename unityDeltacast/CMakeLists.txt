@@ -7,9 +7,10 @@ add_library(unityDeltacast SHARED
     unityDeltacast.h
 	../src/helper.cpp
 )
+target_compile_definitions(unityDeltacast PRIVATE UNITYDELTACAST_BUILD)
 
 # ---- SDK layout (from your listing) ----
-set(VIDEOMASTER_ROOT "C:/Program Files/DELTACAST/VideoMaster")
+set(VIDEOMASTER_ROOT "C:/Program Files/DELTACAST/VideoMaster" CACHE PATH "VideoMaster SDK root")
 set(VM_INCLUDE_CPP   "${VIDEOMASTER_ROOT}/cpp_wrapper/include")
 set(VM_INCLUDE_C     "${VIDEOMASTER_ROOT}/resources/include")
 set(VM_LIB_DIR       "${VIDEOMASTER_ROOT}/resources/lib")
@@ -96,3 +97,9 @@ endif()
 #     "${VM_LIB_DIR}/VideoMasterHD_VbiData.dll"
 #     "${RUNTIME_OUT}"
 # )
+
+option(UNITYDELTACAST_BUILD_TESTS "Build hardware-free adapter tests" OFF)
+if(UNITYDELTACAST_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
