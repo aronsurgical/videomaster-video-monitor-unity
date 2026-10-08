@@ -1,15 +1,30 @@
-# Ignore build directories
+# Build directories
 /build/
+/build-*/
 /out/
 /bin/
 /lib/
 
-# Ignore CMakePresets.json and CMakeUserPresets.json
-CMakePresets.json
+# Build outputs
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+
+# CMake
 CMakeUserPresets.json
 
-# IDE
-/.vscode
+# Visual Studio
+.vs/
 
-# Project specific files
-/src/version.hpp
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
