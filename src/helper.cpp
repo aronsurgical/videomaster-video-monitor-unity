@@ -20,7 +20,6 @@
 #include <optional>
 #include <VideoMasterCppApi/to_string.hpp>
 #include <VideoMasterCppApi/exception.hpp>
-#include <VideoMasterCppApi/to_string.hpp>
 #include <VideoMasterCppApi/helper/sdi.hpp>
 #include <sstream>
 

@@ -35,6 +35,7 @@ UNITYDLL_EXPORT void StartCapture(int index, int device_id, int rx_stream_id, in
     VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, unsigned int fieldMerge,
     VHD_BUFFERPACKING buffer_packing);
 UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth);
+// Also stops the stream's recording, and clears its frame, size and counter.
 UNITYDLL_EXPORT void StopCapture(int index);
 UNITYDLL_EXPORT int GetWidth(int index);
 UNITYDLL_EXPORT int GetHeight(int index);
@@ -43,17 +44,15 @@ UNITYDLL_EXPORT int GetFrame(int index, uint8_t* dst, int maxSize);
 UNITYDLL_EXPORT unsigned long long GetNativeFrameCounter(int index);
 UNITYDLL_EXPORT void SetBurnInFrameNumber(int index, int enabled);
 
-// Example: initialize something
+// Logs "Library initialized!"; Unity calls it first to check that the DLL loads.
 UNITYDLL_EXPORT void InitLibrary();
 
-// Example: add two numbers
-UNITYDLL_EXPORT int AddInts(int a, int b);
-
-// Example: pass a string back to Unity (caller copies it!)
+// Returns and clears the debug log (caller copies it; valid until this thread's next call).
 UNITYDLL_EXPORT const char* GetMessage();
 
 // Copy a human-readable signal/video description for stream `index` into `buffer`
 // (ANSI, null-terminated, truncated to bufferSize). Consumed by Unity's DeltacastAdapter.
+// Also reports "No signal", "Capture error, retrying: ..." and "Stopped".
 UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSize);
 
 // ---- Recording API (offloaded ffmpeg recording, see unityDeltacast.cpp) ----
@@ -63,6 +62,7 @@ UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSi
 //   fps            : constant output frame rate (e.g. 30 or 50)
 //   segmentSeconds : seconds per segment (e.g. 60 -> exactly fps*60 frames per file)
 //   encoderArgs    : optional encoder portion of the ffmpeg command; null/empty -> built-in default
+//                    (keyframes at segment boundaries and the BT.601/709 color tag are always added)
 //   applyVFlip     : 1 -> add "-vf vflip" (the published buffer is vertically flipped)
 // Returns 1 on success (writer thread started), 0 on failure / already recording.
 UNITYDLL_EXPORT int StartRecording(int index,

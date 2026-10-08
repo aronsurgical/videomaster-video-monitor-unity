@@ -1,5 +1,6 @@
 #include "unityDeltacast.h"
 #include "capture_state.hpp"
+#include "pixel_convert.hpp"
 
 #include <string>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <sstream>
 #include <array>
 #include <cstring>
+#include <initializer_list>
 
 // NOMINMAX must be set before any windows.h inclusion so the min/max macros don't clobber
 // the std::min<> used in this file. windows.h itself is included AFTER the VideoMaster headers
@@ -54,34 +56,11 @@ using namespace Application::Helper;
 using namespace Deltacast::Wrapper;
 
 
-//static std::atomic<bool> running{ false };
-//static std::atomic<bool> running2{ false };
-//static std::thread captureThread;
-//static std::thread captureThread2;
-//
-//static std::vector<uint8_t> latestFrame;   // guarded by frameMutex
-//static std::vector<uint8_t> latestFrame2;   // guarded by frameMutex
-//static std::mutex frameMutex;
-//static std::mutex frameMutex2;
-
-
 static deltacast::PublishedFrame publishedFrames[4];
-
-
-
-//static std::vector<uint8_t> bgra;  // scratch BGRA frame
-//static std::vector<uint8_t> bgra2;  // scratch BGRA frame
-
-static std::vector<uint8_t> bgra[4];
 
 // simple static message buffer
 static std::string message = "Hello Deltacast DLL!\n";
 static std::mutex  messageMutex;
-
-//static std::atomic<int> width{ 0 };
-//static std::atomic<int> width2{ 0 };
-//static std::atomic<int> height{ 0 };
-//static std::atomic<int> height2{ 0 };
 
 static std::array<std::atomic<int>, 4> width = {
     std::atomic<int>{0},
@@ -136,465 +115,11 @@ static bool ShouldUseFieldModeBob(const SignalInformation& signalInformation,
 }
 
 
-inline uint8_t clamp8(int x) {
-    return (uint8_t)(x < 0 ? 0 : x>255 ? 255 : x);
-}
-
-// UYVY (U Y0 V Y1) -> BGRA, optional vertical flip
-static void UYVY_to_BGRA(const uint8_t* src, int srcPitch, uint8_t* dst, int dstPitch, int W, int H, bool flipY)
-{
-    for (int y = 0; y < H; ++y) {
-        const uint8_t* s = src + y * srcPitch;
-        // write to bottom-up row if flipping
-        uint8_t* d = dst + (flipY ? (H - 1 - y) * dstPitch : y * dstPitch);
-
-        for (int x = 0; x < W; x += 2) {
-            int U = int(s[0]) - 128;
-            int Y0 = int(s[1]);
-            int V = int(s[2]) - 128;
-            int Y1 = int(s[3]);
-            s += 4;
-
-            auto emit = [&](int Y) {
-                int C = Y - 16; if (C < 0) C = 0;
-                int R = clamp8((298 * C + 409 * V + 128) >> 8);
-                int G = clamp8((298 * C - 100 * U - 208 * V + 128) >> 8);
-                int B = clamp8((298 * C + 516 * U + 128) >> 8);
-                *d++ = (uint8_t)B;
-                *d++ = (uint8_t)G;
-                *d++ = (uint8_t)R;
-                *d++ = 255; // A
-                };
-
-            emit(Y0);
-            emit(Y1);
-        }
-    }
-}
-
-// Convert one packed UYVY field to a full-height BGRA frame using bob
-// deinterlacing. Field lines are copied to their natural parity and the missing
-// lines are interpolated from the nearest captured lines. The SDK returns field
-// lines contiguously; totalBytes may describe either the field payload or a
-// full-frame-sized slot allocation, so derive padding only for a half-frame
-// payload and otherwise use the natural UYVY row size.
-static bool UYVY_Field_to_BGRA_Bob(const uint8_t* src,
-                                   size_t totalBytes,
-                                   uint8_t* dst,
-                                   int dstPitch,
-                                   int W,
-                                   int H,
-                                   bool evenField,
-                                   bool flipY)
-{
-    if (!src || !dst || W <= 0 || H <= 0 || (W & 1) != 0) return false;
-
-    // Field 1/odd carries display rows 0,2,4...; field 2/even carries
-    // display rows 1,3,5... (zero-based row coordinates).
-    const int sourceParity = evenField ? 1 : 0;
-    const int fieldRows = (H - sourceParity + 1) / 2;
-    if (fieldRows <= 0) return false;
-
-    const size_t rowBytes = size_t(W) * 2; // UYVY 4:2:2 8-bit
-    const size_t minimumFieldBytes = rowBytes * size_t(fieldRows);
-    if (totalBytes < minimumFieldBytes) return false;
-
-    size_t srcPitch = rowBytes;
-    const size_t minimumFrameBytes = rowBytes * size_t(H);
-    if (totalBytes < minimumFrameBytes && totalBytes % size_t(fieldRows) == 0) {
-        const size_t candidatePitch = totalBytes / size_t(fieldRows);
-        if (candidatePitch >= rowBytes) srcPitch = candidatePitch;
-    }
-
-    if ((size_t(fieldRows - 1) * srcPitch) + rowBytes > totalBytes) return false;
-
-    // Convert every real field line into its full-frame row.
-    for (int fieldY = 0; fieldY < fieldRows; ++fieldY) {
-        const int sourceFrameY = fieldY * 2 + sourceParity;
-        const int outputY = flipY ? (H - 1 - sourceFrameY) : sourceFrameY;
-
-        UYVY_to_BGRA(
-            src + size_t(fieldY) * srcPitch,
-            int(srcPitch),
-            dst + size_t(outputY) * dstPitch,
-            dstPitch,
-            W,
-            1,
-            false);
-    }
-
-    // Vertical flipping reverses line parity when the output height is even.
-    const int outputFieldParity = flipY ? ((H - 1 - sourceParity) & 1) : sourceParity;
-    const int rowBytesBGRA = W * 4;
-
-    for (int y = 0; y < H; ++y) {
-        if ((y & 1) == outputFieldParity) continue;
-
-        int upY = y - 1;
-        int downY = y + 1;
-        if (upY < 0) upY = downY;
-        if (downY >= H) downY = upY;
-
-        uint8_t* out = dst + size_t(y) * dstPitch;
-        const uint8_t* up = dst + size_t(upY) * dstPitch;
-        const uint8_t* down = dst + size_t(downY) * dstPitch;
-
-        if (upY == downY) {
-            std::memcpy(out, up, rowBytesBGRA);
-        }
-        else {
-            for (int i = 0; i < rowBytesBGRA; ++i) {
-                out[i] = uint8_t((int(up[i]) + int(down[i])) >> 1);
-            }
-        }
-    }
-
-    return true;
-}
-
-//using TechStream = std::variant<Deltacast::Wrapper::SdiStream, Deltacast::Wrapper::DvStream>;
-
-
-
-// copy left & right BGRA images into a single side-by-side BGRA
-static void PackSideBySide_BGRA(const uint8_t* left, int LW, int LH, int LPitch,
-    const uint8_t* right, int RW, int RH, int RPitch,
-    uint8_t* dst, int outW, int outH)
-{
-    const int outPitch = outW * 4;
-    const int copyLeftBytes = LW * 4;
-    const int copyRightBytes = RW * 4;
-    const int rightOffset = LW * 4;
-
-    for (int y = 0; y < outH; ++y) {
-        uint8_t* drow = dst + y * outPitch;
-
-        if (y < LH) {
-            std::memcpy(drow, left + y * LPitch, copyLeftBytes);
-        }
-        else {
-            std::memset(drow, 0, copyLeftBytes);
-        }
-
-        if (y < RH) {
-            std::memcpy(drow + rightOffset, right + y * RPitch, copyRightBytes);
-        }
-        else {
-            std::memset(drow + rightOffset, 0, copyRightBytes);
-        }
-    }
-}
-
-// copy left & right BGRA images into a single side-by-side BGRA
-// with simple "bob" deinterlacing, using SDK-provided parity
-static void PackSideBySide_BGRA_deinterlaced(const uint8_t* left, int LW, int LH, int LPitch,
-    const uint8_t* right, int RW, int RH, int RPitch,
-    uint8_t* dst, int outW, int outH,
-    bool topFieldFirst)  
-{
-    const int outPitch = outW * 4;
-    const int leftBytesRow = LW * 4;
-    const int rightBytesRow = RW * 4;
-    const int rightOffset = LW * 4; // bytes to the start of the right image
-
-    for (int y = 0; y < outH; ++y) {
-        uint8_t* drow = dst + y * outPitch;
-
-        // ---------- LEFT ----------
-        if (y < LH) {
-            const uint8_t* crow = left + y * LPitch;
-
-            bool isFieldLine = ((y & 1) == 0);
-            if (!topFieldFirst) isFieldLine = !isFieldLine;  // flip if bottom-field-first
-
-            if (isFieldLine) {
-                // copy original field line
-                std::memcpy(drow, crow, leftBytesRow);
-            }
-            else {
-                // interpolate odd line
-                const int upY = (y > 0) ? (y - 1) : y;
-                const int dnY = (y + 1 < LH) ? (y + 1) : y;
-                const uint8_t* up = left + upY * LPitch;
-                const uint8_t* dn = left + dnY * LPitch;
-                for (int i = 0; i < leftBytesRow; ++i) {
-                    drow[i] = uint8_t((int(up[i]) + int(dn[i])) >> 1);
-                }
-            }
-        }
-        else {
-            std::memset(drow, 0, leftBytesRow);
-        }
-
-        // ---------- RIGHT ----------
-        uint8_t* drowR = drow + rightOffset;
-        if (y < RH) {
-            const uint8_t* crow = right + y * RPitch;
-
-            bool isFieldLine = ((y & 1) == 0);
-            if (!topFieldFirst) isFieldLine = !isFieldLine;
-
-            if (isFieldLine) {
-                std::memcpy(drowR, crow, rightBytesRow);
-            }
-            else {
-                const int upY = (y > 0) ? (y - 1) : y;
-                const int dnY = (y + 1 < RH) ? (y + 1) : y;
-                const uint8_t* up = right + upY * RPitch;
-                const uint8_t* dn = right + dnY * RPitch;
-                for (int i = 0; i < rightBytesRow; ++i) {
-                    drowR[i] = uint8_t((int(up[i]) + int(dn[i])) >> 1);
-                }
-            }
-        }
-        else {
-            std::memset(drowR, 0, rightBytesRow);
-        }
-    }
-}
-
-
-
 static void logHelper(const std::string& msg)
 {
     std::lock_guard<std::mutex> lk(messageMutex);
     if (message.size() < 2000) {
         message += msg + "\n";
-    }
-}
-
-//void StartCaptureAuto(int device_id, int rx_stream_id, int buffer_depth)
-//{
-//    bool expected = false;
-//    if (!running[0].compare_exchange_strong(expected, true)) return; // already running
-//
-//    if (buffer_depth <= 0) {
-//        buffer_depth = 8;
-//    }
-//
-//    captureThread[0] = std::thread([device_id, rx_stream_id, buffer_depth]() {
-//        bool started = false;
-//        try {
-//            auto board = Board::open(device_id, nullptr);
-//
-//            // open RX tech stream and get base stream
-//            auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
-//            auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
-//
-//            // 1) Wait until a signal is present on the connector
-//            if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[0])) {
-//                throw std::runtime_error("No input detected on the requested RX");
-//            }
-//
-//            // 2) Detect signal information (format, framerate, etc.)
-//            auto signal_information = Application::Helper::detect_information(rx_tech_stream);
-//            //signal_information = SdiSignalInformation{ VHD_VIDEOSTD_S274M_1080i_50Hz, VHD_CLOCKDIV_1, VHD_INTERFACE_3G_B_DS_425_1 };
-//            //signal_information = DvSignalInformation{ VHD_VIDEOSTD_S274M_1080i_50Hz, VHD_CLOCKDIV_1, VHD_INTERFACE_3G_B_DS_425_1 };
-//            auto vc = Application::Helper::get_video_characteristics(signal_information);
-//            int W = vc.width;
-//            int H = vc.height;
-//            width[0].store(W);
-//            height[0].store(H);
-//
-//
-//            // 3) Queue depth & packing
-//            rx_stream.buffer_queue().set_depth(buffer_depth);
-//            rx_stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
-//
-//            //field merge necesary for example in stereo dual stream
-//            //rx_stream.enable_field_merge();
-//
-//            // 4) Configure stream to match the detected signal
-//            Application::Helper::configure_stream(rx_tech_stream, signal_information);
-//
-//
-//
-//            // 5) Start the stream
-//            rx_stream.start();
-//
-//            started = true;
-//
-//            bgra[0].resize(size_t(width[0]) * height[0] * 4);
-//
-//            DC_LOG("width=" + std::to_string(width[0]));
-//            DC_LOG("height=" + std::to_string(height[0]));
-//
-//            while (running[0].load()) {
-//                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running[0])) {
-//                    continue;
-//                }
-//
-//                // If signal changes mid-run, reconfigure
-//                auto cur = Application::Helper::detect_information(rx_tech_stream);
-//                if (cur != signal_information) {
-//                    if (started) { 
-//                        rx_stream.stop();
-//                        started = false;
-//                    }
-//                    signal_information = cur;
-//                    vc = Application::Helper::get_video_characteristics(signal_information);
-//                    W = vc.width;
-//                    H = vc.height;
-//                    width[0].store(W); height[0].store(H);
-//                    bgra[0].resize(size_t(W) * H * 4);
-//
-//                    rx_stream.buffer_queue().set_depth(buffer_depth);
-//                    rx_stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
-//                    Application::Helper::configure_stream(rx_tech_stream, signal_information);
-//                    rx_stream.start();
-//                    started = true;
-//                    continue;
-//                }
-//
-//                auto slot = rx_stream.pop_slot();
-//                auto [src, totalBytes] = slot->video().buffer();
-//
-//                // derive source pitch (handles driver alignment)
-//                if (height[0] <= 0) {
-//                    continue;
-//                }
-//                int srcPitch = int(totalBytes / height[0]);   // sanity: if (totalBytes % H) -> alignment mismatch
-//                int dstPitch = width[0] * 4;
-//
-//                UYVY_to_BGRA(src, srcPitch, bgra[0].data(), dstPitch, width[0], height[0], true);
-//
-//                {
-//                    std::lock_guard<std::mutex> lock(frameMutex[0]);
-//                    latestFrame[0] = bgra[0];  // hand BGRA to Unity
-//                }
-//                //log("running");
-//            }
-//            if (started) {
-//                rx_stream.stop();
-//                started = false;
-//            }
-//            DC_LOG("finished");
-//        }
-//        catch (const ApiException& e) {
-//            DC_LOG(std::string("ApiException: ") + e.what());
-//        }
-//        catch (const std::exception& e) {
-//            DC_LOG(std::string("std::exception: ") + e.what());
-//        }
-//        });
-//}
-
-static const uint8_t DIGITS_3x5[10][5] = {
-    {0b111, 0b101, 0b101, 0b101, 0b111}, // 0
-    {0b010, 0b110, 0b010, 0b010, 0b111}, // 1
-    {0b111, 0b001, 0b111, 0b100, 0b111}, // 2
-    {0b111, 0b001, 0b111, 0b001, 0b111}, // 3
-    {0b101, 0b101, 0b111, 0b001, 0b001}, // 4
-    {0b111, 0b100, 0b111, 0b001, 0b111}, // 5
-    {0b111, 0b100, 0b111, 0b101, 0b111}, // 6
-    {0b111, 0b001, 0b001, 0b001, 0b001}, // 7
-    {0b111, 0b101, 0b111, 0b101, 0b111}, // 8
-    {0b111, 0b101, 0b111, 0b001, 0b111}  // 9
-};
-
-static void SetPixelBGRA(uint8_t* img, int W, int H, int pitch, int x, int y,
-    uint8_t b, uint8_t g, uint8_t r, uint8_t a = 255)
-{
-    if (x < 0 || y < 0 || x >= W || y >= H) return;
-
-    uint8_t* p = img + y * pitch + x * 4;
-    p[0] = b;
-    p[1] = g;
-    p[2] = r;
-    p[3] = a;
-}
-
-static void FillRectBGRA(uint8_t* img, int W, int H, int pitch,
-    int x0, int y0, int rw, int rh,
-    uint8_t b, uint8_t g, uint8_t r, uint8_t a = 255)
-{
-    for (int y = y0; y < y0 + rh; ++y) {
-        for (int x = x0; x < x0 + rw; ++x) {
-            SetPixelBGRA(img, W, H, pitch, x, y, b, g, r, a);
-        }
-    }
-}
-
-static void DrawDigit3x5BGRA(uint8_t* img, int W, int H, int pitch,
-    int digit, int x0, int y0, int scale,
-    uint8_t b, uint8_t g, uint8_t r,
-    bool flipTextY)
-{
-    if (digit < 0 || digit > 9) return;
-
-    for (int row = 0; row < 5; ++row) {
-        int srcRow = flipTextY ? (4 - row) : row;
-        uint8_t bits = DIGITS_3x5[digit][srcRow];
-
-        for (int col = 0; col < 3; ++col) {
-            bool on = (bits & (1 << (2 - col))) != 0;
-            if (!on) continue;
-
-            for (int sy = 0; sy < scale; ++sy) {
-                for (int sx = 0; sx < scale; ++sx) {
-                    SetPixelBGRA(
-                        img, W, H, pitch,
-                        x0 + col * scale + sx,
-                        y0 + row * scale + sy,
-                        b, g, r, 255
-                    );
-                }
-            }
-        }
-    }
-}
-
-static void BurnFrameNumberBGRA(uint8_t* img,
-    int imageW,
-    int imageH,
-    int pitch,
-    unsigned long long frameNo,
-    int regionX,
-    int regionW,
-    bool bufferIsVerticallyFlipped)
-{
-    if (!img || imageW <= 0 || imageH <= 0 || pitch <= 0 || regionW <= 0) {
-        return;
-    }
-
-    const int scale = 2;
-    const int gap = scale;
-    const int margin = 4;
-
-    std::string text = std::to_string(frameNo);
-
-    int digitW = 3 * scale;
-    int digitH = 5 * scale;
-    int textW = int(text.size()) * digitW + int(text.size() - 1) * gap;
-    int textH = digitH;
-
-    int x = regionX + regionW - textW - margin;
-
-    // If the buffer is vertically flipped before Unity displays it,
-    // native bottom becomes visible top.
-    int y = bufferIsVerticallyFlipped
-        ? imageH - margin - textH
-        : margin;
-
-    FillRectBGRA(img, imageW, imageH, pitch,
-        x - 2, y - 2,
-        textW + 4, textH + 4,
-        0, 0, 0, 255);
-
-    int cx = x;
-    for (char c : text) {
-        if (c >= '0' && c <= '9') {
-            DrawDigit3x5BGRA(
-                img, imageW, imageH, pitch,
-                c - '0',
-                cx, y,
-                scale,
-                255, 255, 255,
-                bufferIsVerticallyFlipped
-            );
-        }
-
-        cx += digitW + gap;
     }
 }
 
@@ -624,6 +149,13 @@ struct RecorderCtx {
     // resolution locked once the first frame is available
     int width = 0;
     int height = 0;
+
+    // A writer that stopped on its own is still joinable; destroying it unjoined would
+    // std::terminate the host process at exit (same rule as CaptureWorker).
+    ~RecorderCtx() {
+        recording.store(false);
+        if (thread.joinable()) thread.join();
+    }
 };
 
 static RecorderCtx recorders[4];
@@ -637,15 +169,21 @@ static std::string BuildFfmpegCommand(const RecorderCtx& r)
         "-c:v h264_nvenc -preset p1 -rc vbr -cq 22 -pix_fmt yuv420p -g "
         + std::to_string(r.fps) + " -rgb_mode yuv420";
     const std::string& encoder = r.encoderArgs.empty() ? defaultEncoder : r.encoderArgs;
+    // Encode RGB back to YUV with the matrix the frames were decoded with, and tag it.
+    const bool hd = deltacast::IsHdHeight(r.height);
 
     std::ostringstream cmd;
     cmd << "\"" << r.ffmpegExe << "\""
         << " -y -f rawvideo -pixel_format bgra"
         << " -video_size " << r.width << "x" << r.height
         << " -framerate " << r.fps
-        << " -i -";
-    if (r.vflip) cmd << " -vf vflip";
+        << " -i -"
+        << " -vf " << (r.vflip ? "vflip," : "")
+        << "scale=out_color_matrix=" << (hd ? "bt709" : "bt601");
     cmd << " " << encoder
+        << " -colorspace " << (hd ? "bt709" : "smpte170m")
+        // segments are cut at keyframes; force one at every boundary even for custom encoder args
+        << " -force_key_frames expr:gte(t,n_forced*" << r.segmentSeconds << ")"
         << " -f segment -segment_time " << r.segmentSeconds
         << " -reset_timestamps 1 -segment_format mov"
         << " \"" << r.outputPattern << "\"";
@@ -671,6 +209,12 @@ static bool WriteAllToPipe(HANDLE h, const uint8_t* data, size_t size)
 // On success, fills hStdInWr (write end, owned by caller) and pi.
 static bool SpawnFfmpeg(RecorderCtx& r, HANDLE& hStdInWr, PROCESS_INFORMATION& pi)
 {
+    // Inheritable handles leak into every process created while they exist. Serialize the
+    // recorders' spawns so no ffmpeg holds another stream's pipe: that ffmpeg would keep the
+    // pipe alive, so a dead encoder would block its writer instead of failing it.
+    static std::mutex spawnMutex;
+    std::lock_guard<std::mutex> spawnLock(spawnMutex);
+
     hStdInWr = nullptr;
     ZeroMemory(&pi, sizeof(pi));
 
@@ -679,13 +223,14 @@ static bool SpawnFfmpeg(RecorderCtx& r, HANDLE& hStdInWr, PROCESS_INFORMATION& p
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = nullptr;
 
+    // Create both ends non-inheritable; only the child's read end is made inheritable, so
+    // the write end (whose last copy closing signals end-of-input) never leaks.
     HANDLE hStdInRd = nullptr;
-    if (!CreatePipe(&hStdInRd, &hStdInWr, &sa, 0)) {
+    if (!CreatePipe(&hStdInRd, &hStdInWr, nullptr, 0)) {
         DC_LOG("rec: CreatePipe failed err=" + std::to_string(GetLastError()));
         return false;
     }
-    // The write end stays in the parent and must NOT be inherited by the child.
-    SetHandleInformation(hStdInWr, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hStdInRd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 
     // ffmpeg's diagnostics go to a log file next to the output (a file, not a pipe, so it
     // can never deadlock on a full pipe). Fall back to NUL if the log can't be created.
@@ -810,14 +355,80 @@ static void RecordWriterLoop(int index)
 }
 
 
+// ============================ Capture ============================
+
+// Clears what Unity and the recorder read for `index`, so a stopped or restarting stream
+// never serves the previous session's frame or resolution.
+static void ResetStream(int index, const char* status)
+{
+    publishedFrames[index].reset();
+    width[index].store(0);
+    height[index].store(0);
+    SetVideoInfo(index, status);
+}
+
+template<class Work>
+static void StartWorker(int index, Work work)
+{
+    try {
+        captureWorkers[index].start([index] { ResetStream(index, "Starting"); }, std::move(work));
+    } catch (const std::exception& e) {
+        SetVideoInfo(index, std::string("Capture start failed: ") + e.what());
+    } catch (...) {
+        SetVideoInfo(index, "Capture start failed");
+    }
+}
+
+// Runs capture sessions until StopCapture. Any SDK error (cable pulled, slot timeout,
+// failed detection) ends only the current session; the next one starts after a short pause.
+template<class Session>
+static void RunCaptureSessions(int index, Session session)
+{
+    auto& running = captureWorkers[index].running;
+    while (running.load()) {
+        try {
+            session();
+        } catch (const std::exception& e) {
+            SetVideoInfo(index, std::string("Capture error, retrying: ") + e.what());
+            DC_LOG(std::string("capture error: ") + e.what());
+            for (int i = 0; i < 5 && running.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
+// Waits until the connector carries a signal; false once StopCapture was requested.
+// (Application::Helper::wait_for_input expects a stop flag, not the running flag.)
+static bool WaitForSignal(int index, BoardComponents::RxConnector& rx)
+{
+    if (rx.signal_present()) return true;
+    SetVideoInfo(index, "No signal");
+    while (captureWorkers[index].running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (rx.signal_present()) return true;
+    }
+    return false;
+}
+
+// Burns the next publication number into the top-right corner of each {x, width} region of
+// the frame (when enabled), then publishes it.
+static void PublishFrame(int index, std::vector<uint8_t>& frame, int W, int H,
+                         std::initializer_list<std::pair<int, int>> regions)
+{
+    if (burnInFrameNumber[index].load(std::memory_order_relaxed)) {
+        const unsigned long long frameNo = publishedFrames[index].sequence() + 1;
+        for (const auto& [x, w] : regions)
+            deltacast::BurnFrameNumberBGRA(frame.data(), W, H, W * 4, frameNo, x, w, true);
+    }
+    publishedFrames[index].publish(frame);
+}
+
+
 extern "C" {
 
+    // Unity calls this first; it doubles as the "is the DLL present" probe.
     UNITYDLL_EXPORT void InitLibrary() {
         DC_LOG("Library initialized!");
-    }
-
-    UNITYDLL_EXPORT int AddInts(int a, int b) {
-        return a + b;
     }
 
     UNITYDLL_EXPORT const char* GetMessage() {
@@ -838,20 +449,20 @@ extern "C" {
 
     UNITYDLL_EXPORT void SetBurnInFrameNumber(int index, int enabled)
     {
-        if (index < 0 || index >= 4) return;
+        if (!deltacast::valid_index(index)) return;
 
         burnInFrameNumber[index].store(enabled != 0, std::memory_order_relaxed);
     }
 
     UNITYDLL_EXPORT unsigned long long GetNativeFrameCounter(int index)
     {
-        if (index < 0 || index >= 4) return 0;
+        if (!deltacast::valid_index(index)) return 0;
 
         return publishedFrames[index].sequence();
     }
 
     UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSize) {
-        if (index < 0 || index >= 4 || !buffer || bufferSize <= 0)
+        if (!deltacast::valid_index(index) || !buffer || bufferSize <= 0)
             return;
 
         std::lock_guard<std::mutex> lk(videoInfoMutex[index]);
@@ -868,7 +479,7 @@ extern "C" {
                                        const char* encoderArgs,
                                        int applyVFlip)
     {
-        if (index < 0 || index >= 4) return 0;
+        if (!deltacast::valid_index(index)) return 0;
         if (!outputPattern || !*outputPattern) return 0;
         if (fps <= 0) fps = 30;
         if (segmentSeconds <= 0) segmentSeconds = 60;
@@ -906,7 +517,7 @@ extern "C" {
 
     UNITYDLL_EXPORT void StopRecording(int index)
     {
-        if (index < 0 || index >= 4) return;
+        if (!deltacast::valid_index(index)) return;
         std::lock_guard<std::mutex> lifecycle(recordingLifecycle[index]);
         RecorderCtx& r = recorders[index];
         r.recording.store(false, std::memory_order_relaxed);
@@ -915,13 +526,13 @@ extern "C" {
 
     UNITYDLL_EXPORT int IsRecording(int index)
     {
-        if (index < 0 || index >= 4) return 0;
+        if (!deltacast::valid_index(index)) return 0;
         return recorders[index].recording.load(std::memory_order_relaxed) ? 1 : 0;
     }
 
     UNITYDLL_EXPORT unsigned long long GetRecordedFrameNumber(int index)
     {
-        if (index < 0 || index >= 4) return 0;
+        if (!deltacast::valid_index(index)) return 0;
         return recorders[index].recordedFrame.load(std::memory_order_relaxed);
     }
 
@@ -944,7 +555,7 @@ UNITYDLL_EXPORT void StartCapture(
     unsigned int fieldMerge,
     VHD_BUFFERPACKING buffer_packing)
 {
-    if (index < 0 || index >= 4) {
+    if (!deltacast::valid_index(index)) {
         return;
     }
 
@@ -952,569 +563,205 @@ UNITYDLL_EXPORT void StartCapture(
         SetVideoInfo(index, "Unsupported buffer packing: UYVY8 required");
         return;
     }
-    std::lock_guard<std::mutex> lifecycle(recordingLifecycle[index]);
-    if (recorders[index].recording.load()) return;
 
     if (buffer_depth <= 0) {
         buffer_depth = 8;
     }
 
-    try {
-        captureWorkers[index].start([index] {
-            publishedFrames[index].reset();
-            width[index].store(0);
-            height[index].store(0);
-            SetVideoInfo(index, "Starting");
-        }, [index, device_id, rx_stream_id, buffer_depth, inputType, requested_width, requested_height, progressive, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMerge, buffer_packing]() {
-            bool started = false;
-            try {
-                auto board = Board::open(device_id, nullptr);
+    const bool forcedSdi = (inputType == 'S' || inputType == 's');
+    const bool forcedDv = (inputType == 'D' || inputType == 'd');
 
-                // open RX tech stream and get base stream
-                auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
-                auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
+    StartWorker(index, [=] {
+        std::vector<uint8_t> frame;
+        RunCaptureSessions(index, [&] {
+            auto board = Board::open(device_id, nullptr);
+            auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
+            auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
+            auto& rx = board.rx(rx_stream_id);
+            const bool forced = forcedSdi || forcedDv;
 
-                // 1) Wait until a signal is present on the connector
-                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[index].running)) {
-                    //throw std::runtime_error("No input detected on the requested RX");
+            // Detection needs a signal. A forced format starts without one: the second link of a
+            // dual-stream input (e.g. RX1) only reports a signal once its stream runs.
+            if (!forced && !WaitForSignal(index, rx)) return;
+
+            SignalInformation signal_information;
+            if (forcedSdi) {
+                signal_information = SdiSignalInformation{ video_standard, clock_divisor, video_interface };
+            }
+            else if (forcedDv) {
+                signal_information = DvSignalInformation{ requested_width, requested_height, progressive != 0, framerate, cable_color_space, cable_sampling };
+            }
+            else { // prefered inputType == 'A'
+                signal_information = Application::Helper::detect_information(rx_tech_stream);
+            }
+            const auto vc = Application::Helper::get_video_characteristics(signal_information);
+            const int W = vc.width;
+            const int H = vc.height;
+            width[index].store(W);
+            height[index].store(H);
+
+            // Make info of the signal available as a simple string
+            const std::string info = Application::Helper::get_information_string(signal_information, "[Video] ");
+            SetVideoInfo(index, info);
+
+            rx_stream.buffer_queue().set_depth(buffer_depth);
+            rx_stream.set_buffer_packing(buffer_packing);
+
+            // Preserve the existing merged-frame behavior for fieldMerge != 0.
+            // For an interlaced Level-B dual stream, fieldMerge == 0 selects
+            // field mode and publishes one bob-deinterlaced frame per field.
+            DC_LOG("fieldMerge=" + std::to_string(fieldMerge));
+            if (fieldMerge != 0) {
+                rx_stream.enable_field_merge();
+            }
+            const bool useFieldModeBob = ShouldUseFieldModeBob(signal_information, fieldMerge);
+
+            Application::Helper::configure_stream(rx_tech_stream, signal_information);
+
+            if (useFieldModeBob) {
+                if (!board.supports_field_mode()) {
+                    throw std::runtime_error("The selected DELTACAST board does not support field mode");
                 }
+                rx_stream.enable_field_mode();
+                DC_LOG("field mode bob enabled");
+            }
 
-                // 2) Detect signal information (format, framerate, etc.)
-                
+            // The stream stops itself when it goes out of scope (session end or error).
+            rx_stream.start();
 
-                SignalInformation signal_information;
-                if (inputType == 'S' || inputType == 's'){
-                    signal_information = SdiSignalInformation{ video_standard, clock_divisor, video_interface };
+            frame.resize(size_t(W) * H * 4);
+            const int dstPitch = W * 4;
+            const auto& matrix = deltacast::MatrixForHeight(H);
+            DC_LOG("capturing " + std::to_string(W) + "x" + std::to_string(H));
+
+            while (captureWorkers[index].running.load()) {
+                if (!rx.signal_present()) {
+                    // Auto mode ends the session and re-detects once the signal is back;
+                    // a forced format waits with its stream running.
+                    if (!forced || !WaitForSignal(index, rx)) return;
+                    SetVideoInfo(index, info);
+                    continue;
                 }
-                else if(inputType == 'D' || inputType == 'd'){
-                    signal_information = DvSignalInformation{ requested_width, requested_height, progressive != 0, framerate, cable_color_space, cable_sampling };
+                // Only auto mode follows the input. A forced format is kept even when
+                // detection disagrees (e.g. 1080psf25 and 1080i50 look identical on the wire).
+                if (!forced && Application::Helper::detect_information(rx_tech_stream) != signal_information) return;
 
-                }
-                else {// prefered inputType == 'A'
-                    signal_information = Application::Helper::detect_information(rx_tech_stream);
-                }
-                auto vc = Application::Helper::get_video_characteristics(signal_information);
-                int W = vc.width;
-                int H = vc.height;
-                width[index].store(W);
-                height[index].store(H);
-
-                // Make info of the signal available as a simple string
-                SetVideoInfo(index, Application::Helper::get_information_string(signal_information, "[Video] "));
-
-                // 3) Queue depth & packing
-                rx_stream.buffer_queue().set_depth(buffer_depth);
-                rx_stream.set_buffer_packing(buffer_packing);
-
-                // Preserve the existing merged-frame behavior for fieldMerge != 0.
-                // For an interlaced Level-B dual stream, fieldMerge == 0 selects
-                // field mode and publishes one bob-deinterlaced frame per field.
-                DC_LOG("fieldMerge=" + std::to_string(fieldMerge));
-                if (fieldMerge != 0) {
-                    rx_stream.enable_field_merge();
-                }
-
-                bool useFieldModeBob = ShouldUseFieldModeBob(signal_information, fieldMerge);
-
-                // 4) Configure stream to match the detected signal
-                Application::Helper::configure_stream(rx_tech_stream, signal_information);
+                auto slot = rx_stream.pop_slot();
+                auto [src, totalBytes] = slot->video().buffer();
 
                 if (useFieldModeBob) {
-                    if (!board.supports_field_mode()) {
-                        throw std::runtime_error("The selected DELTACAST board does not support field mode");
-                    }
-                    rx_stream.enable_field_mode();
-                    DC_LOG("field mode bob enabled");
-                }
-
-
-
-                // 5) Start the stream
-                rx_stream.start();
-
-                started = true;
-
-                bgra[index].resize(size_t(width[index]) * height[index] * 4);
-
-                DC_LOG("width=" + std::to_string(width[index]));
-                DC_LOG("height=" + std::to_string(height[index]));
-
-                while (captureWorkers[index].running.load()) {
-                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[index].running)) {
+                    const bool evenField = (slot->parity() == Slot::Parity::EVEN);
+                    if (!deltacast::UYVY_Field_to_BGRA_Bob(src, totalBytes, frame.data(), dstPitch,
+                                                           W, H, evenField, true, matrix)) {
+                        DC_LOG("field mode bob: unexpected field buffer size="
+                            + std::to_string(totalBytes));
                         continue;
                     }
-                    // If signal changes mid-run, reconfigure
-                    auto cur = Application::Helper::detect_information(rx_tech_stream);
-                    if (cur != signal_information) {
-                        if (started) { 
-                            rx_stream.stop();
-                            started = false; 
-                        }
-                        signal_information = cur;
-                        SetVideoInfo(index, Application::Helper::get_information_string(signal_information, "[Video] "));
-                        vc = Application::Helper::get_video_characteristics(signal_information);
-                        W = vc.width;
-                        H = vc.height;
-                        width[index].store(W);
-                        height[index].store(H);
-                        bgra[index].resize(size_t(W) * H * 4);
-
-                        rx_stream.buffer_queue().set_depth(buffer_depth);
-                        rx_stream.set_buffer_packing(buffer_packing);
-
-                        const bool newUseFieldModeBob = ShouldUseFieldModeBob(signal_information, fieldMerge);
-                        if (useFieldModeBob && !newUseFieldModeBob) {
-                            rx_stream.disable_field_mode();
-                        }
-
-                        Application::Helper::configure_stream(rx_tech_stream, signal_information);
-
-                        if (!useFieldModeBob && newUseFieldModeBob) {
-                            if (!board.supports_field_mode()) {
-                                throw std::runtime_error("The selected DELTACAST board does not support field mode");
-                            }
-                            rx_stream.enable_field_mode();
-                        }
-                        useFieldModeBob = newUseFieldModeBob;
-
-                        rx_stream.start();
-                        started = true;
+                }
+                else {
+                    // Same size rule as the field path: never read past the slot buffer.
+                    if (totalBytes < size_t(W) * 2 * H) {
+                        DC_LOG("unexpected frame buffer size=" + std::to_string(totalBytes));
                         continue;
                     }
-                    auto slot = rx_stream.pop_slot();
-                    auto [src, totalBytes] = slot->video().buffer();
-                    if (height[index] <= 0) {
-                        continue;
-                    }
-                    int dstPitch = width[index] * 4;
-
-                    if (useFieldModeBob) {
-                        const bool evenField = (slot->parity() == Slot::Parity::EVEN);
-                        if (!UYVY_Field_to_BGRA_Bob(
-                                src,
-                                totalBytes,
-                                bgra[index].data(),
-                                dstPitch,
-                                width[index],
-                                height[index],
-                                evenField,
-                                true)) {
-                            DC_LOG("field mode bob: unexpected field buffer size="
-                                + std::to_string(totalBytes));
-                            continue;
-                        }
-                    }
-                    else {
-                        // Derive source pitch for the legacy full-frame path.
-                        int srcPitch = int(totalBytes / height[index]);
-                        UYVY_to_BGRA(src, srcPitch, bgra[index].data(), dstPitch,
-                            width[index], height[index], true);
-                    }
-
-                    const unsigned long long frameNo =
-                        publishedFrames[index].sequence() + 1;
-
-                    if (burnInFrameNumber[index].load(std::memory_order_relaxed)) {
-                        BurnFrameNumberBGRA(
-                            bgra[index].data(),
-                            width[index],
-                            height[index],
-                            dstPitch,
-                            frameNo,
-                            0,
-                            width[index],
-                            true
-                        );
-                    }
-                    publishedFrames[index].publish(bgra[index]);
-
-                    //log("running");
+                    deltacast::UYVY_to_BGRA(src, int(totalBytes / H), frame.data(), dstPitch,
+                                            W, H, true, matrix);
                 }
-                if (started) {
-                    rx_stream.stop();
-                    started = false;
-                }
-                DC_LOG("finished");
+
+                PublishFrame(index, frame, W, H, { {0, W} });
             }
-            catch (const ApiException& e) {
-                SetVideoInfo(index, std::string("Capture failed: ") + e.what());
-                DC_LOG(std::string("ApiException: ") + e.what());
-            }
-            catch (const std::exception& e) {
-                SetVideoInfo(index, std::string("Capture failed: ") + e.what());
-                DC_LOG(std::string("std::exception: ") + e.what());
-            }
-            });
-    } catch (const std::exception& e) {
-        SetVideoInfo(index, std::string("Capture start failed: ") + e.what());
-    } catch (...) {
-        SetVideoInfo(index, "Capture start failed");
-    }
+        });
+    });
 }
 
-    ////AW: HACK!!! remember to always use both methods
-    //UNITYDLL_EXPORT void StartCapture2(int device_id, int rx_stream_id, int buffer_depth, char inputType, unsigned int requested_width, unsigned int requested_height, unsigned int progressive, unsigned int framerate, VHD_DV_CS cable_color_space, VHD_DV_SAMPLING cable_sampling, VHD_VIDEOSTANDARD video_standard, VHD_CLOCKDIVISOR clock_divisor, VHD_INTERFACE video_interface, unsigned int fieldMerge, VHD_BUFFERPACKING buffer_packing)
-    //{
-    //    bool expected = false;
-    //    if (!running2.compare_exchange_strong(expected, true)) return; // already running
-
-    //    if (buffer_depth <= 0) {
-    //        buffer_depth = 8;
-    //    }
-
-    //    captureThread2 = std::thread([device_id, rx_stream_id, buffer_depth, inputType, requested_width, requested_height, progressive, framerate, cable_color_space, cable_sampling, video_standard, clock_divisor, video_interface, fieldMerge, buffer_packing]() {
-    //        bool started = false;
-    //        try {
-    //            auto board = Board::open(device_id, nullptr);
-
-    //            // open RX tech stream and get base stream
-    //            auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
-    //            auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
-
-    //            // 1) Wait until a signal is present on the connector
-    //            if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running2)) {
-    //                throw std::runtime_error("No input detected on the requested RX");
-    //            }
-
-    //            // 2) Detect signal information (format, framerate, etc.)
-
-
-    //            SignalInformation signal_information;
-    //            if (inputType == 'S' || inputType == 's') {
-    //                signal_information = SdiSignalInformation{ video_standard, clock_divisor, video_interface };
-    //            }
-    //            else if (inputType == 'D' || inputType == 'd') {
-    //                signal_information = DvSignalInformation{ requested_width, requested_height, progressive != 0, framerate, cable_color_space, cable_sampling };
-
-    //            }
-    //            else {// prefered inputType == 'A'
-    //                signal_information = Application::Helper::detect_information(rx_tech_stream);
-    //            }
-
-    //            auto vc = Application::Helper::get_video_characteristics(signal_information);
-    //            int W = vc.width;
-    //            int H = vc.height;
-    //            width2.store(W);
-    //            height2.store(H);
-
-
-    //            // 3) Queue depth & packing
-    //            rx_stream.buffer_queue().set_depth(buffer_depth);
-    //            rx_stream.set_buffer_packing(buffer_packing);
-
-    //            //field merge necesary for example in stereo dual stream
-    //            DC_LOG("fieldMerge=" + std::to_string(fieldMerge));
-    //            if (fieldMerge != 0) {
-    //                rx_stream.enable_field_merge();
-    //            }
-
-    //            // 4) Configure stream to match the detected signal
-    //            Application::Helper::configure_stream(rx_tech_stream, signal_information);
-
-
-
-    //            // 5) Start the stream
-    //            rx_stream.start();
-
-    //            started = true;
-
-    //            bgra2.resize(size_t(width2) * height2 * 4);
-
-    //            DC_LOG("width=" + std::to_string(width2));
-    //            DC_LOG("height=" + std::to_string(height2));
-
-    //            while (running2.load()) {
-    //                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), running2)) {
-    //                    continue;
-    //                }
-
-    //                // If signal changes mid-run, reconfigure
-    //                auto cur = Application::Helper::detect_information(rx_tech_stream);
-    //                if (cur != signal_information) {
-    //                    if (started) { rx_stream.stop(); started = false; }
-    //                    signal_information = cur;
-    //                    vc = Application::Helper::get_video_characteristics(signal_information);
-    //                    W = vc.width; H = vc.height;
-    //                    width2.store(W); height2.store(H);
-    //                    bgra2.resize(size_t(W) * H * 4);
-
-    //                    rx_stream.buffer_queue().set_depth(buffer_depth);
-    //                    rx_stream.set_buffer_packing(buffer_packing);
-    //                    Application::Helper::configure_stream(rx_tech_stream, signal_information);
-    //                    rx_stream.start();
-    //                    started = true;
-    //                    continue;
-    //                }
-
-    //                auto slot = rx_stream.pop_slot();
-    //                auto [src, totalBytes] = slot->video().buffer();
-
-    //                // derive source pitch (handles driver alignment)
-    //                if (height2 <= 0) {
-    //                    continue;
-    //                }
-    //                int srcPitch = int(totalBytes / height2);   // sanity: if (totalBytes % H) -> alignment mismatch
-    //                int dstPitch = width2 * 4;
-
-    //                UYVY_to_BGRA(src, srcPitch, bgra2.data(), dstPitch, width2, height2, true);
-
-    //                {
-    //                    std::lock_guard<std::mutex> lock(frameMutex2);
-    //                    latestFrame2 = bgra2;  // hand BGRA to Unity
-    //                }
-    //                //log("running");
-    //            }
-    //            if (started) {
-    //                rx_stream.stop();
-    //                started = false;
-    //            }
-    //            DC_LOG("finished");
-    //        }
-    //        catch (const ApiException& e) {
-    //            DC_LOG(std::string("ApiException: ") + e.what());
-    //        }
-    //        catch (const std::exception& e) {
-    //            DC_LOG(std::string("std::exception: ") + e.what());
-    //        }
-    //        });
-    //}
-
+// Side-by-side stereo from a fixed 1080i50 3G-B dual-stream input: left eye from
+// rx_stream_id, right eye always from RX1. Publishes to index 0.
 UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buffer_depth)
 {
-    std::lock_guard<std::mutex> lifecycle(recordingLifecycle[0]);
-    if (recorders[0].recording.load()) return;
-
     if (buffer_depth <= 0) {
         buffer_depth = 8;
     }
 
-    try {
-        captureWorkers[0].start([] {
-            publishedFrames[0].reset();
-            width[0].store(0);
-            height[0].store(0);
-            SetVideoInfo(0, "Starting");
-        }, [device_id, rx_stream_id, buffer_depth]() {
-            bool started = false;
-            std::array<std::vector<uint8_t>, 2> bgra;
-            std::vector<uint8_t> sbsBGRA;
-            try {
-                auto board = Board::open(device_id, nullptr);
-                DC_LOG("0");
-                // open RX tech stream and get base stream
-                auto rx_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
-                auto rx_tech_stream2 = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(1));
-                auto& rx_stream = Application::Helper::to_base_stream(rx_tech_stream);
-                auto& rx_stream2 = Application::Helper::to_base_stream(rx_tech_stream2);
-                DC_LOG("1");
-                // 1) Wait until a signal is present on the connector
-                if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[0].running)) {
-                    throw std::runtime_error("No input detected on the requested RX");
-                }
-                DC_LOG("2");
-                // 2) Detect signal information (format, framerate, etc.)
-                SignalInformation signal_information;// = Application::Helper::detect_information(rx_tech_stream);
-                SignalInformation signal_information2;// = Application::Helper::detect_information(rx_tech_stream2);
-                DC_LOG("2.1");
-                signal_information = SdiSignalInformation{ VHD_VIDEOSTD_S274M_1080i_50Hz, VHD_CLOCKDIV_1, VHD_INTERFACE_3G_B_DS_425_1 };
-                signal_information2 = SdiSignalInformation{ VHD_VIDEOSTD_S274M_1080i_50Hz, VHD_CLOCKDIV_1, VHD_INTERFACE_3G_B_DS_425_1 };
-                
-                DC_LOG("2.2");
-                auto vc = Application::Helper::get_video_characteristics(signal_information);
-                auto vc2 = Application::Helper::get_video_characteristics(signal_information2);
-                DC_LOG("2.3");
-                // after vc / vc2 have been computed:
-                int W = vc.width, H = vc.height;
-                int W2 = vc2.width, H2 = vc2.height;
+    StartWorker(0, [=] {
+        std::vector<uint8_t> frame;
+        RunCaptureSessions(0, [&] {
+            auto board = Board::open(device_id, nullptr);
+            auto left_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(rx_stream_id));
+            auto right_tech_stream = Application::Helper::open_stream(board, Application::Helper::rx_index_to_streamtype(1));
+            auto& rx = board.rx(rx_stream_id);
 
-                auto [outW, outH] = deltacast::stereo_extent(W, H, W2, H2);
+            if (!WaitForSignal(0, rx)) return;
 
-                width[0].store(outW);
-                height[0].store(outH);
+            const SignalInformation signal_information =
+                SdiSignalInformation{ VHD_VIDEOSTD_S274M_1080i_50Hz, VHD_CLOCKDIV_1, VHD_INTERFACE_3G_B_DS_425_1 };
+            const auto vc = Application::Helper::get_video_characteristics(signal_information);
+            const int W = vc.width;
+            const int H = vc.height;
+            const auto [outW, outH] = deltacast::stereo_extent(W, H, W, H);
 
-                // Make info of the signal available as a simple string (stereo publishes to index 0)
-                SetVideoInfo(0, Application::Helper::get_information_string(signal_information, "[Video] "));
+            width[0].store(outW);
+            height[0].store(outH);
+            SetVideoInfo(0, Application::Helper::get_information_string(signal_information, "[Video] "));
 
-                // allocate working & output buffers
-                bgra[0].resize(size_t(W) * H * 4);
-                bgra[1].resize(size_t(W2) * H2 * 4);
-                sbsBGRA.resize(size_t(outW) * outH * 4);
-                DC_LOG("stereo: L=" + std::to_string(W) + "x" + std::to_string(H)
-                    + " R=" + std::to_string(W2) + "x" + std::to_string(H2)
-                    + " out=" + std::to_string(outW) + "x" + std::to_string(outH));
-
-                DC_LOG("3");
-                // 3) Queue depth & packing
-                rx_stream.buffer_queue().set_depth(buffer_depth);
-                rx_stream2.buffer_queue().set_depth(buffer_depth);
-                rx_stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
-                rx_stream2.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
-
-                DC_LOG("?");
-                //????
-                rx_stream.enable_field_merge();
-                rx_stream2.enable_field_merge();
-                //rx_stream.set_low_latency_mode(VHD_LLM_DATA_BLOCK);
-                //rx_stream2.set_low_latency_mode(VHD_LLM_DATA_BLOCK);
-
-                DC_LOG("4");
-                // 4) Configure stream to match the detected signal
-                Application::Helper::configure_stream(rx_tech_stream, signal_information);
-                Application::Helper::configure_stream(rx_tech_stream2, signal_information2);
-
-
-                DC_LOG("5");
-                // 5) Start the stream
-                rx_stream.start();
-                rx_stream2.start();
-
-                started = true;
-
-                while (captureWorkers[0].running.load()) {
-                    if (!Application::Helper::wait_for_input(board.rx(rx_stream_id), captureWorkers[0].running)) {
-                        continue;
-                    }
-                    DC_LOG("6");
-                    // If signal changes mid-run, reconfigure
-                    auto cur = Application::Helper::detect_information(rx_tech_stream);
-                    if (cur != signal_information) {
-                        if (started) {
-                            rx_stream.stop();
-                            started = false; 
-                        }
-                        DC_LOG("6");
-                        signal_information = cur;
-                        SetVideoInfo(0, Application::Helper::get_information_string(signal_information, "[Video] "));
-                        vc = Application::Helper::get_video_characteristics(signal_information);
-                        W = vc.width; H = vc.height;
-                        const auto extent = deltacast::stereo_extent(W, H, W2, H2);
-                        outW = extent.first;
-                        outH = extent.second;
-                        width[0].store(outW);
-                        height[0].store(outH);
-                        bgra[0].resize(size_t(W) * H * 4);
-                        sbsBGRA.resize(size_t(outW) * outH * 4);
-
-                        rx_stream.buffer_queue().set_depth(buffer_depth);
-                        rx_stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
-                        Application::Helper::configure_stream(rx_tech_stream, signal_information);
-                        rx_stream.start();
-                        started = true;
-                        continue;
-                    }
-                    DC_LOG("8");
-                    auto slot = rx_stream.pop_slot();
-                    auto slot2 = rx_stream2.pop_slot();
-                    auto [src, totalBytes] = slot->video().buffer();
-                    auto [src2, totalBytes2] = slot2->video().buffer();
-
-                    int srcPitch = (H > 0) ? int(totalBytes / H) : 0;
-                    int srcPitch2 = (H2 > 0) ? int(totalBytes2 / H2) : 0;
-
-                    int dstPitch = W * 4;
-                    int dstPitch2 = W2 * 4;
-                    DC_LOG("9");
-                    UYVY_to_BGRA(src, srcPitch, bgra[0].data(), dstPitch, W, H, true);
-                    UYVY_to_BGRA(src2, srcPitch2, bgra[1].data(), dstPitch2, W2, H2, true);
-
-                    bool topFieldFirst = (slot->parity() == Slot::Parity::EVEN);
-                    // pack into one wide texture
-                    PackSideBySide_BGRA_deinterlaced(bgra[0].data(), W, H, dstPitch,
-                        bgra[1].data(), W2, H2, dstPitch2,
-                        sbsBGRA.data(), outW, outH, topFieldFirst);
-
-                    const unsigned long long frameNo =
-                        publishedFrames[0].sequence() + 1;
-
-                    if (burnInFrameNumber[0].load(std::memory_order_relaxed)) {
-                        const int outPitch = outW * 4;
-
-                        // Burn into upper-right corner of the left eye.
-                        BurnFrameNumberBGRA(
-                            sbsBGRA.data(),
-                            outW,
-                            outH,
-                            outPitch,
-                            frameNo,
-                            0,
-                            W,
-                            true
-                        );
-
-                        // Burn the same number into upper-right corner of the right eye.
-                        BurnFrameNumberBGRA(
-                            sbsBGRA.data(),
-                            outW,
-                            outH,
-                            outPitch,
-                            frameNo,
-                            W,
-                            W2,
-                            true
-                        );
-                    }
-                    // publish the single combined frame
-                    publishedFrames[0].publish(sbsBGRA);
-
-
-                    //log("running");
-                    DC_LOG("10");
-                }
-                DC_LOG("11");
-                if (started) {
-                    rx_stream.stop();
-                    rx_stream2.stop();
-                    started = false;
-                }
-                DC_LOG("finished");
+            for (auto* tech_stream : { &left_tech_stream, &right_tech_stream }) {
+                auto& stream = Application::Helper::to_base_stream(*tech_stream);
+                stream.buffer_queue().set_depth(buffer_depth);
+                stream.set_buffer_packing(VHD_BUFPACK_VIDEO_YUV422_8);
+                stream.enable_field_merge();
+                Application::Helper::configure_stream(*tech_stream, signal_information);
             }
-            catch (const ApiException& e) {
-                SetVideoInfo(0, std::string("Capture failed: ") + e.what());
-                DC_LOG(std::string("ApiException: ") + e.what());
+            auto& left = Application::Helper::to_base_stream(left_tech_stream);
+            auto& right = Application::Helper::to_base_stream(right_tech_stream);
+            left.start();
+            right.start();
+
+            frame.resize(size_t(outW) * outH * 4);
+            const int pitch = outW * 4;
+            const auto& matrix = deltacast::MatrixForHeight(H);
+            DC_LOG("stereo: capturing " + std::to_string(outW) + "x" + std::to_string(outH));
+
+            while (captureWorkers[0].running.load()) {
+                if (!rx.signal_present()) return;
+
+                auto leftSlot = left.pop_slot();
+                auto rightSlot = right.pop_slot();
+                // simple "bob" deinterlacing of each eye, using SDK-provided parity
+                const int keptParity = (leftSlot->parity() == Slot::Parity::EVEN) ? 0 : 1;
+
+                bool complete = true;
+                for (int eye = 0; eye < 2 && complete; ++eye) {
+                    auto [src, totalBytes] = (eye == 0 ? leftSlot : rightSlot)->video().buffer();
+                    if (totalBytes < size_t(W) * 2 * H) {
+                        DC_LOG("stereo: unexpected frame buffer size=" + std::to_string(totalBytes));
+                        complete = false;
+                        break;
+                    }
+                    // Convert each eye straight into its half of the side-by-side frame.
+                    uint8_t* eyeOrigin = frame.data() + size_t(eye) * W * 4;
+                    deltacast::UYVY_to_BGRA(src, int(totalBytes / H), eyeOrigin, pitch, W, H, true, matrix);
+                    deltacast::BobFillMissingRows(eyeOrigin, W, H, pitch, keptParity);
+                }
+                if (!complete) continue;
+
+                PublishFrame(0, frame, outW, outH, { {0, W}, {W, W} });
             }
-            catch (const std::exception& e) {
-                SetVideoInfo(0, std::string("Capture failed: ") + e.what());
-                DC_LOG(std::string("std::exception: ") + e.what());
-            }
-            });
-    } catch (const std::exception& e) {
-        SetVideoInfo(0, std::string("Capture start failed: ") + e.what());
-    } catch (...) {
-        SetVideoInfo(0, "Capture start failed");
-    }
+        });
+    });
 }
 
 
     UNITYDLL_EXPORT void StopCapture(int index)
     {
         if (!deltacast::valid_index(index)) return;
-        captureWorkers[index].stop([index] { SetVideoInfo(index, "Stopped"); });
+        // A recording never outlives its capture; it would only repeat the last frame.
+        StopRecording(index);
+        captureWorkers[index].stop([index] { ResetStream(index, "Stopped"); });
     }
-
-    //UNITYDLL_EXPORT void StopCapture2()
-    //{
-    //    running2.store(false);
-    //    if (captureThread2.joinable()) {
-    //        captureThread2.join();
-    //    }
-    //}
 
     UNITYDLL_EXPORT int GetFrame(int index, uint8_t* dst, int maxSize)
     {
         if (!deltacast::valid_index(index)) return 0;
         return publishedFrames[index].copy(dst, maxSize);
     }
-
-    //UNITYDLL_EXPORT int GetFrame2(uint8_t* dst, int maxSize)
-    //{
-    //    std::lock_guard<std::mutex> lk(frameMutex2);
-    //    int n = std::min<int>(maxSize, latestFrame2.size());
-    //    if (n > 0) {
-    //        std::memcpy(dst, latestFrame2.data(), n);
-    //    }
-    //    return n;
-    //}
-
-
 
 } // extern "C"

@@ -18,4 +18,6 @@ endif()
 
 add_subdirectory("src")
 add_subdirectory("deps")
-add_subdirectory(unityDeltacast)
+if(WIN32) # the Unity DLL uses the Win32 process/pipe API
+    add_subdirectory(unityDeltacast)
+endif()

@@ -87,16 +87,7 @@ if(MSVC)
   endif()
 endif()
 
-# ---- (Optional) copy runtime DLLs next to your DLL for testing/Unity ----
-# set(RUNTIME_OUT "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
-# add_custom_command(TARGET unityDeltacast POST_BUILD
-#   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-#     "${VM_LIB_DIR}/VideoMasterHD.dll"
-#     "${VM_LIB_DIR}/VideoMasterHD_Audio.dll"
-#     "${VM_LIB_DIR}/VideoMasterHD_Vbi.dll"
-#     "${VM_LIB_DIR}/VideoMasterHD_VbiData.dll"
-#     "${RUNTIME_OUT}"
-# )
+# Copy the built DLL into Unity with tools/deploy_unity.ps1.
 
 option(UNITYDELTACAST_BUILD_TESTS "Build hardware-free adapter tests" OFF)
 if(UNITYDELTACAST_BUILD_TESTS)
