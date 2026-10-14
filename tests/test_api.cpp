@@ -91,3 +91,27 @@ TEST_CASE("a recorder still running at exit does not crash the process")
     // fix the process died with 0xC0000409 on exit, which fails this test run.
     REQUIRE(StartRecording(2, "ffmpeg", "unused_%03d.mov", 25, 60, nullptr, 1) == 1);
 }
+
+TEST_CASE("the texture update callback always hands Unity pixels of the texture's size")
+{
+    UnityRenderingEventAndData callback = GetTextureUpdateCallback();
+    REQUIRE(callback != nullptr);
+
+    UnityRenderingExtTextureUpdateParamsV2 params{};
+    params.width = 4;
+    params.height = 2;
+    params.bpp = 4;
+    params.userData = 7;
+    callback(kUnityRenderingExtEventUpdateTextureBeginV2, &params);
+    CHECK(params.texData == nullptr);
+
+    params.userData = 3;
+    callback(kUnityRenderingExtEventUpdateTextureEndV2, &params);
+    CHECK(params.texData == nullptr);
+
+    callback(kUnityRenderingExtEventUpdateTextureBeginV2, &params);
+    REQUIRE(params.texData != nullptr);
+    const auto* pixels = static_cast<const uint8_t*>(params.texData);
+    for (int i = 0; i < 4 * 2 * 4; ++i) CHECK(pixels[i] == 0);
+    callback(kUnityRenderingExtEventUpdateTextureEndV2, &params);
+}

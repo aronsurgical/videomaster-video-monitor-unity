@@ -39,6 +39,8 @@ add_library(unityDeltacast SHARED ${LIB_SOURCES})
 target_include_directories(unityDeltacast
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        # Unity native plugin API (IUnityRenderingExtensions.h), vendored from the Unity editor's PluginAPI
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/unity
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )

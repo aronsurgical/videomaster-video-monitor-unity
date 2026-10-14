@@ -55,6 +55,25 @@ void logHelper(const std::string& msg)
 
 using namespace deltacast;
 
+// Render thread only. Unity reads texData between Begin and End, so the frame is copied out of
+// the published buffer rather than holding its lock across the upload.
+static std::vector<uint8_t> uploadStaging[4];
+static uint64_t uploadSeen[4];
+
+static void UNITY_INTERFACE_API OnTextureUpdate(int eventId, void* data)
+{
+    if (eventId != kUnityRenderingExtEventUpdateTextureBeginV2 || !data) return;
+    auto* params = static_cast<UnityRenderingExtTextureUpdateParamsV2*>(data);
+    const int index = static_cast<int>(params->userData);
+    if (!valid_index(index)) return;
+    const size_t bytes = size_t(params->width) * params->height * params->bpp;
+    std::vector<uint8_t>& staging = uploadStaging[index];
+    publishedFrames[index].copy_new(uploadSeen[index], bytes, staging);
+    // Unity requires texData; a texture the frame does not fit gets its previous (or black) pixels.
+    if (staging.size() != bytes) staging.assign(bytes, 0);
+    params->texData = staging.data();
+}
+
 extern "C" {
 
     // Unity calls this first; it doubles as the "is the DLL present" probe.
@@ -106,6 +125,11 @@ extern "C" {
     {
         if (!valid_index(index)) return 0;
         return publishedFrames[index].copy(dst, maxSize);
+    }
+
+    UNITYDLL_EXPORT UnityRenderingEventAndData GetTextureUpdateCallback()
+    {
+        return OnTextureUpdate;
     }
 
 } // extern "C"

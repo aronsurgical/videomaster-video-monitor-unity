@@ -4,6 +4,7 @@
 #include <VideoMasterHD_Core.h>
 #include <VideoMasterHD_Dv.h>
 #include <VideoMasterHD_Sdi.h>
+#include <IUnityRenderingExtensions.h>
 
 #ifdef _WIN32
 #  ifdef UNITYDELTACAST_BUILD
@@ -42,6 +43,10 @@ UNITYDLL_EXPORT int GetHeight(int index);
 // Returns the whole frame size, or zero without writing if unavailable or too small.
 UNITYDLL_EXPORT int GetFrame(int index, uint8_t* dst, int maxSize);
 UNITYDLL_EXPORT unsigned long long GetNativeFrameCounter(int index);
+// Callback for CommandBuffer.IssuePluginCustomTextureUpdateV2 with userData = capture index: Unity's
+// render thread uploads the newest published frame, so the copy and upload leave the main thread.
+// A texture whose size differs from the frame keeps its previous contents.
+UNITYDLL_EXPORT UnityRenderingEventAndData GetTextureUpdateCallback();
 UNITYDLL_EXPORT void SetBurnInFrameNumber(int index, int enabled);
 
 // Logs "Library initialized!"; Unity calls it first to check that the DLL loads.

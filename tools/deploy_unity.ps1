@@ -71,7 +71,7 @@ if (-not $PluginDir) {
 # Entry points DeltacastAdapter.cs calls (its unused AddInts declaration excluded).
 $RequiredExports = @(
     "InitLibrary", "GetMessage", "GetWidth", "GetHeight", "GetFrame",
-    "GetNativeFrameCounter", "SetBurnInFrameNumber", "GetSignalAndVideoInfo",
+    "GetNativeFrameCounter", "GetTextureUpdateCallback", "SetBurnInFrameNumber", "GetSignalAndVideoInfo",
     "StartCapture", "StartCaptureStereo", "StopCapture",
     "StartRecording", "StopRecording", "IsRecording", "GetRecordedFrameNumber"
 )
