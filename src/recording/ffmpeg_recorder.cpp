@@ -128,7 +128,11 @@ static bool SpawnFfmpeg(RecorderCtx& r, HANDLE& hStdInWr, PROCESS_INFORMATION& p
 
     // ffmpeg's diagnostics go to a log file next to the output (a file, not a pipe, so it
     // can never deadlock on a full pipe). Fall back to NUL if the log can't be created.
-    const std::string logPath = r.outputPattern + ".ffmpeg.log";
+    // Named after the stream, not the segment pattern, so the file name holds no literal "%03d".
+    std::string logPath = r.outputPattern;
+    const size_t segment = logPath.find("_part_%03d");
+    if (segment != std::string::npos) logPath.erase(segment, std::string("_part_%03d").size());
+    logPath += ".ffmpeg.log";
     HANDLE hLog = CreateFileA(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hLog == INVALID_HANDLE_VALUE) {
