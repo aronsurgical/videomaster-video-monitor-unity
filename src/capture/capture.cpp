@@ -101,14 +101,14 @@ static bool WaitForSignal(int index, BoardComponents::RxConnector& rx)
 // Burns the next publication number into the top-right corner of each {x, width} region of
 // the frame (when enabled), then publishes it.
 static void PublishFrame(int index, std::vector<uint8_t>& frame, int W, int H,
-                         std::initializer_list<std::pair<int, int>> regions)
+                         std::initializer_list<std::pair<int, int>> regions, int64_t arrivalHostUs)
 {
     if (burnInFrameNumber[index].load(std::memory_order_relaxed)) {
         const unsigned long long frameNo = publishedFrames[index].sequence() + 1;
         for (const auto& [x, w] : regions)
             BurnFrameNumberBGRA(frame.data(), W, H, W * 4, frameNo, x, w, true);
     }
-    publishedFrames[index].publish(frame);
+    publishedFrames[index].publish(frame, arrivalHostUs);
 }
 
 
@@ -224,6 +224,7 @@ UNITYDLL_EXPORT void StartCapture(
                 if (!forced && Application::Helper::detect_information(rx_tech_stream) != signal_information) return;
 
                 auto slot = rx_stream.pop_slot();
+                const int64_t arrivalHostUs = HostNowUs();
                 auto [src, totalBytes] = slot->video().buffer();
 
                 if (useFieldModeBob) {
@@ -244,7 +245,7 @@ UNITYDLL_EXPORT void StartCapture(
                     UYVY_to_BGRA(src, int(totalBytes / H), frame.data(), dstPitch, W, H, true, matrix);
                 }
 
-                PublishFrame(index, frame, W, H, { {0, W} });
+                PublishFrame(index, frame, W, H, { {0, W} }, arrivalHostUs);
             }
         });
     });
@@ -301,6 +302,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
 
                 auto leftSlot = left.pop_slot();
                 auto rightSlot = right.pop_slot();
+                const int64_t arrivalHostUs = HostNowUs();
                 // simple "bob" deinterlacing of each eye, using SDK-provided parity
                 const int keptParity = (leftSlot->parity() == Slot::Parity::EVEN) ? 0 : 1;
 
@@ -319,7 +321,7 @@ UNITYDLL_EXPORT void StartCaptureStereo(int device_id, int rx_stream_id, int buf
                 }
                 if (!complete) continue;
 
-                PublishFrame(0, frame, outW, outH, { {0, W}, {W, W} });
+                PublishFrame(0, frame, outW, outH, { {0, W}, {W, W} }, arrivalHostUs);
             }
         });
     });

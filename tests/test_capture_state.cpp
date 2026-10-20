@@ -157,3 +157,18 @@ TEST_CASE("CaptureWorker lifecycle")
     worker.stop();
     CHECK(ordered.load());
 }
+
+TEST_CASE("PublishedFrame hands out the capture time of the frame it copies")
+{
+    deltacast::PublishedFrame published;
+    std::vector<uint8_t> destination;
+    uint64_t seen = 0;
+    int64_t hostUs = -1;
+    published.publish(std::vector<uint8_t>(8, 1), 1234);
+    CHECK(published.copy_new(seen, 8, destination, &hostUs) == deltacast::SnapshotResult::Copied);
+    CHECK(hostUs == 1234);
+    published.publish(std::vector<uint8_t>(8, 2), 5678);
+    CHECK(published.copy_new(seen, 8, destination) == deltacast::SnapshotResult::Copied);
+    CHECK(published.copy_new(seen, 8, destination, &hostUs) == deltacast::SnapshotResult::Unchanged);
+    CHECK(hostUs == 1234);
+}

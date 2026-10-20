@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -66,6 +67,12 @@ private:
     std::thread thread_;
 };
 
+// QPC-backed on Windows, the same clock the Atracsys library and Unity's Stopwatch read.
+inline int64_t HostNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 enum class SnapshotResult { Unchanged, Copied, SizeChanged };
 
 class PublishedFrame {
@@ -73,12 +80,14 @@ public:
     void reset() {
         std::lock_guard<std::mutex> lock(mutex_);
         pixels_.clear();
+        hostUs_ = 0;
         sequence_ = 0;
     }
 
-    void publish(const std::vector<uint8_t>& pixels) {
+    void publish(const std::vector<uint8_t>& pixels, int64_t hostUs = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         pixels_ = pixels;
+        hostUs_ = hostUs;
         ++sequence_;
     }
 
@@ -97,18 +106,20 @@ public:
     }
 
     SnapshotResult copy_new(uint64_t& seen, size_t expected_bytes,
-                            std::vector<uint8_t>& destination) const {
+                            std::vector<uint8_t>& destination, int64_t* hostUs = nullptr) const {
         std::lock_guard<std::mutex> lock(mutex_);
         if (sequence_ == seen || pixels_.empty()) return SnapshotResult::Unchanged;
         if (pixels_.size() != expected_bytes) return SnapshotResult::SizeChanged;
         destination = pixels_;
         seen = sequence_;
+        if (hostUs) *hostUs = hostUs_;
         return SnapshotResult::Copied;
     }
 
 private:
     mutable std::mutex mutex_;
     std::vector<uint8_t> pixels_;
+    int64_t hostUs_ = 0;
     uint64_t sequence_ = 0;
 };
 

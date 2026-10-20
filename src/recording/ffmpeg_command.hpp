@@ -48,6 +48,24 @@ inline std::string BuildFfmpegCommand(const FfmpegRecording& r)
     return cmd.str();
 }
 
+// One row per written frame, numbered like the stream's subtitles; dup marks a repeated image.
+inline std::string FramesIndexPath(const std::string& outputPattern)
+{
+    const std::string token = "_Video_part_%03d.mov";
+    const size_t at = outputPattern.rfind(token);
+    return at != std::string::npos && at + token.size() == outputPattern.size()
+        ? outputPattern.substr(0, at) + "_frames.jsonl" : outputPattern + ".frames.jsonl";
+}
+
+inline std::string FrameIndexRow(const FfmpegRecording& r, unsigned long long frame, long long hostUs, bool duplicate)
+{
+    const unsigned long long partFrames = static_cast<unsigned long long>(r.fps) * r.segmentSeconds;
+    std::ostringstream row;
+    row << "{\"part\":" << r.firstPart + frame / partFrames << ",\"local\":" << frame % partFrames
+        << ",\"host_us\":" << hostUs << ",\"dup\":" << (duplicate ? 1 : 0) << "}";
+    return row.str();
+}
+
 // Named after the stream, not the segment pattern, so the file name holds no literal "%03d".
 inline std::string FfmpegLogPath(std::string outputPattern)
 {

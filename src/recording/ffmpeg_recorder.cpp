@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -167,15 +168,17 @@ static void RecordWriterLoop(int index)
     std::vector<uint8_t> last;   // most recent snapshot; reused as the gap-fill source
     bool haveLast = false;
     uint64_t lastCapturedSeen = 0;  // last capture-frame counter we copied
+    int64_t lastHostUs = 0;
     unsigned long long nextIdx = 0;
     bool resolutionChanged = false;
+    FILE* frameIndex = std::fopen(FramesIndexPath(r.config.outputPattern).c_str(), "ab");
 
     while (r.recording.load(std::memory_order_relaxed)) {
         const auto target = t0 + std::chrono::nanoseconds(
             (long long)(double(nextIdx) * interval * 1e9));
         std::this_thread::sleep_until(target);
 
-        const auto snapshot = publishedFrames[index].copy_new(lastCapturedSeen, frameBytes, last);
+        const auto snapshot = publishedFrames[index].copy_new(lastCapturedSeen, frameBytes, last, &lastHostUs);
         if (snapshot == SnapshotResult::Copied) haveLast = true;
         if (snapshot == SnapshotResult::SizeChanged) resolutionChanged = true;
 
@@ -193,11 +196,16 @@ static void RecordWriterLoop(int index)
             DC_LOG("rec: pipe write failed (ffmpeg gone?) index=" + std::to_string(index));
             break;
         }
+        if (frameIndex) {
+            std::fputs((FrameIndexRow(r.config, nextIdx, lastHostUs, snapshot != SnapshotResult::Copied) + "\n").c_str(), frameIndex);
+            if ((nextIdx + 1) % r.config.fps == 0) std::fflush(frameIndex);
+        }
         r.recordedFrame.fetch_add(1, std::memory_order_relaxed);
         ++nextIdx;
     }
 
     timeEndPeriod(1);
+    if (frameIndex) std::fclose(frameIndex);
 
     // 4) Teardown: closing stdin tells ffmpeg to flush and finalize the last segment.
     if (hStdInWr) { CloseHandle(hStdInWr); hStdInWr = nullptr; }
