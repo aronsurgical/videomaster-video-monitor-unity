@@ -66,6 +66,7 @@ UNITYDLL_EXPORT void GetSignalAndVideoInfo(int index, char* buffer, int bufferSi
 //   outputPattern  : segment output pattern, e.g. "C:\\rec\\Stream0_Video_part_%03d.mov"
 //   fps            : constant output frame rate (e.g. 30 or 50)
 //   segmentSeconds : seconds per segment (e.g. 60 -> exactly fps*60 frames per file)
+//   firstPart      : number of the first segment file; a resumed recording continues there (>= 0)
 //   encoderArgs    : optional encoder portion of the ffmpeg command; null/empty -> built-in default
 //                    (keyframes at segment boundaries and the BT.601/709 color tag are always added)
 //   applyVFlip     : 1 -> add "-vf vflip" (the published buffer is vertically flipped)
@@ -75,6 +76,7 @@ UNITYDLL_EXPORT int StartRecording(int index,
                                    const char* outputPattern,
                                    int fps,
                                    int segmentSeconds,
+                                   int firstPart,
                                    const char* encoderArgs,
                                    int applyVFlip);
 

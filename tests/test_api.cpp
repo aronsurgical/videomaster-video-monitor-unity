@@ -37,7 +37,7 @@ TEST_CASE("invalid stream indices return zero and touch nothing")
         CHECK(GetHeight(index) == 0);
         CHECK(GetNativeFrameCounter(index) == 0);
         CHECK(GetFrame(index, buffer.data(), static_cast<int>(buffer.size())) == 0);
-        CHECK(StartRecording(index, "ffmpeg", "unused_%03d.mov", 25, 60, nullptr, 1) == 0);
+        CHECK(StartRecording(index, "ffmpeg", "unused_%03d.mov", 25, 60, 0, nullptr, 1) == 0);
         CHECK(IsRecording(index) == 0);
         CHECK(GetRecordedFrameNumber(index) == 0);
         CHECK(Info(index) == "unchanged");
@@ -75,11 +75,17 @@ TEST_CASE("StartCapture rejects every packing except UYVY8")
     CHECK(GetNativeFrameCounter(0) == 0);
 }
 
+TEST_CASE("StartRecording rejects a negative first segment")
+{
+    CHECK(StartRecording(3, "ffmpeg", "unused_%03d.mov", 25, 60, -1, nullptr, 1) == 0);
+    CHECK(IsRecording(3) == 0);
+}
+
 TEST_CASE("StopCapture also ends the stream's recording")
 {
     // Without a capture the writer waits for a resolution, so no ffmpeg is launched.
-    REQUIRE(StartRecording(1, "ffmpeg", "unused_%03d.mov", 25, 60, nullptr, 1) == 1);
-    CHECK(StartRecording(1, "ffmpeg", "unused_%03d.mov", 25, 60, nullptr, 1) == 0);
+    REQUIRE(StartRecording(1, "ffmpeg", "unused_%03d.mov", 25, 60, 0, nullptr, 1) == 1);
+    CHECK(StartRecording(1, "ffmpeg", "unused_%03d.mov", 25, 60, 0, nullptr, 1) == 0);
     CHECK(IsRecording(1) == 1);
     StopCapture(1);
     CHECK(IsRecording(1) == 0);
@@ -89,7 +95,7 @@ TEST_CASE("a recorder still running at exit does not crash the process")
 {
     // Deliberately left running: the DLL's static teardown must join it. Before that
     // fix the process died with 0xC0000409 on exit, which fails this test run.
-    REQUIRE(StartRecording(2, "ffmpeg", "unused_%03d.mov", 25, 60, nullptr, 1) == 1);
+    REQUIRE(StartRecording(2, "ffmpeg", "unused_%03d.mov", 25, 60, 0, nullptr, 1) == 1);
 }
 
 TEST_CASE("the texture update callback always hands Unity pixels of the texture's size")

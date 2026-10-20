@@ -24,6 +24,7 @@ add_executable(unityDeltacast_tests_unit
     doctest_main.cpp
     test_capture_state.cpp
     test_pixel_convert.cpp
+    test_ffmpeg_command.cpp
 )
 target_include_directories(unityDeltacast_tests_unit PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(unityDeltacast_tests_unit PRIVATE doctest_vendored)
